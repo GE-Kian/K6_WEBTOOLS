@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NODE_ENV=production
+    ports:
+      - "6666:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      - k6web_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-admin1234}@db:3306/k6_web_tools
+      - FLASK_ENV=production
+      - FLASK_DEBUG=0
+      - FLASK_PORT=5000
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend/scripts:/app/scripts:ro
+      - ./backend/reports:/app/reports
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    restart: unless-stopped
+    networks:
+      - k6web_network
+
+  db:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-admin1234}
+      - MYSQL_DATABASE=k6_web_tools
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    restart: unless-stopped
+    networks:
+      - k6web_network
+
+volumes:
+  mysql_data:
+    driver: local
+
+networks:
+  k6web_network:
+    driver: bridge

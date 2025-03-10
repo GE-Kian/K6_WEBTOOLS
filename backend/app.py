@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from gevent import monkey
+monkey.patch_all()
+
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, join_room, leave_room, emit, ConnectionRefusedError, disconnect
 from flask_cors import CORS
@@ -10,7 +13,7 @@ import json
 import logging
 from dotenv import load_dotenv
 from models import db, TestConfig, TestResult, PerformanceMetric, Script
-from k6_manager import K6Manager
+from k6_manager import K6Manager, k6_monitor
 from werkzeug.utils import secure_filename
 import mysql.connector
 import sys
@@ -20,9 +23,9 @@ import time
 import threading
 from flask_cors import cross_origin
 from engineio.payload import Payload
-from gevent import monkey, spawn_later, lock
+from gevent import spawn_later, lock
 from collections import defaultdict
-monkey.patch_all()
+from broadcast import init_socketio
 
 # 增加最大数据包大小
 Payload.max_decode_packets = 1000
@@ -54,8 +57,28 @@ app = Flask(__name__)
 # 配置CORS
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# 确保必要的目录存在
+data_dir = os.path.join(app.root_path, 'data')
+scripts_dir = os.path.join(app.root_path, 'scripts')
+reports_dir = os.path.join(app.root_path, 'reports')
+
+for directory in [data_dir, scripts_dir, reports_dir]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+        logger.info(f'创建目录: {directory}')
+
 # 数据库配置
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
+db_uri = os.getenv('SQLALCHEMY_DATABASE_URI')
+if db_uri and db_uri.startswith('sqlite:///'):
+    # 如果是 SQLite，确保使用绝对路径
+    db_path = db_uri.replace('sqlite:///', '')
+    if not os.path.isabs(db_path):
+        db_path = os.path.join(data_dir, db_path)
+    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+else:
+    # 如果是其他数据库（如MySQL），直接使用配置的URI
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_uri or f'sqlite:///{os.path.join(data_dir, "k6_webtools.db")}'
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_POOL_SIZE'] = int(os.getenv('DB_POOL_SIZE', 10))
 app.config['SQLALCHEMY_MAX_OVERFLOW'] = int(os.getenv('DB_MAX_OVERFLOW', 20))
@@ -65,10 +88,19 @@ app.config['SQLALCHEMY_POOL_TIMEOUT'] = int(os.getenv('DB_POOL_TIMEOUT', 30))
 db.init_app(app)
 with app.app_context():
     try:
+        # 删除现有的表（如果存在）
+        db.drop_all()
+        # 创建新的表结构
         db.create_all()
         logger.info('数据库连接成功并完成初始化')
     except Exception as e:
         logger.error(f'数据库连接或初始化失败: {str(e)}')
+        if 'mysql' in str(e).lower():
+            logger.error('MySQL连接失败。请确保：\n'
+                        '1. MySQL服务已启动\n'
+                        '2. 数据库已创建\n'
+                        '3. 用户名和密码正确\n'
+                        '4. 数据库主机可访问')
         raise
 
 # 配置SocketIO
@@ -83,6 +115,9 @@ socketio = SocketIO(
     logger=True,
     engineio_logger=True
 )
+
+# 初始化广播功能
+init_socketio(socketio)
 
 # 活动连接
 active_connections = set()
@@ -160,22 +195,13 @@ def broadcast_test_status(test_id, status, message=None):
         'timestamp': datetime.now().isoformat()
     })
 
-# 确保SQLite数据库文件所在目录存在
-if app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite:///'):
-    db_path = app.config['SQLALCHEMY_DATABASE_URI'].replace('sqlite:///', '')
-    if not os.path.isabs(db_path):  # 如果是相对路径
-        db_path = os.path.join(app.root_path, db_path)
-    db_dir = os.path.dirname(os.path.abspath(db_path))
-    if not os.path.exists(db_dir):
-        os.makedirs(db_dir)
-        logger.info(f'创建数据库目录: {db_dir}')
-
 # 配置文件上传大小限制和超时
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 app.config['UPLOAD_TIMEOUT'] = UPLOAD_TIMEOUT
 
 # 初始化K6管理器
 k6_manager = K6Manager()
+k6_manager.init_app(app)
 
 # 确保脚本和报告目录存在
 scripts_dir = os.getenv('K6_SCRIPTS_DIR', os.path.join(app.root_path, 'scripts'))
@@ -222,8 +248,12 @@ def upload_script():
         # 确保目录存在
         scripts_dir = os.getenv('K6_SCRIPTS_DIR', 'scripts')
         full_scripts_dir = os.path.join(app.root_path, scripts_dir)
-        os.makedirs(full_scripts_dir, exist_ok=True)
-        logger.info(f'脚本目录: {full_scripts_dir}, 是否存在: {os.path.exists(full_scripts_dir)}')
+        dist_dir = os.path.join(full_scripts_dir, 'dist')  # 添加dist目录
+        
+        # 创建必要的目录
+        for directory in [full_scripts_dir, dist_dir]:
+            os.makedirs(directory, exist_ok=True)
+            logger.info(f'确保目录存在: {directory}')
         
         # 保存文件
         try:
@@ -231,6 +261,14 @@ def upload_script():
             logger.info(f'尝试保存文件到: {file_path}')
             file.save(file_path)
             logger.info(f'文件已保存到: {file_path}, 文件大小: {os.path.getsize(file_path)} 字节')
+            
+            # 检查并创建crypto-bundle.js在同一目录
+            crypto_bundle_path = os.path.join(full_scripts_dir, 'crypto-bundle.js')
+            if not os.path.exists(crypto_bundle_path):
+                with open(crypto_bundle_path, 'w', encoding='utf-8') as f:
+                    f.write('// Crypto bundle placeholder\n')
+                logger.info(f'创建crypto-bundle.js: {crypto_bundle_path}')
+                
         except Exception as e:
             logger.error(f'保存文件失败: {str(e)}', exc_info=True)
             return jsonify({'error': f'保存文件失败: {str(e)}'}), 500
@@ -238,9 +276,12 @@ def upload_script():
         # 创建脚本记录
         try:
             script = Script(
-                name=filename,  # 直接使用文件名作为脚本名称
+                name=filename,
                 filename=filename,
-                path=file_path
+                path=file_path,
+                dependencies={
+                    'crypto_bundle': crypto_bundle_path
+                }
             )
             db.session.add(script)
             db.session.commit()
@@ -255,7 +296,8 @@ def upload_script():
             'filename': script.filename,
             'path': script.path,
             'description': script.description,
-            'created_at': script.created_at.isoformat()
+            'created_at': script.created_at.isoformat(),
+            'dependencies': script.dependencies
         }), 201
         
     except Exception as e:
@@ -283,28 +325,29 @@ def start_test():
     try:
         data = request.get_json()
         script_id = data.get('script_id')
-        vus = data.get('vus', 1)
-        duration = data.get('duration', 30)
-        ramp_time = data.get('ramp_time', 0)
-
+        
         if not script_id:
             return jsonify({'success': False, 'message': '缺少脚本ID'}), 400
 
         # 获取脚本信息
-        script = Script.query.get(script_id)
+        script = db.session.get(Script, script_id)
         if not script:
             return jsonify({'success': False, 'message': '脚本不存在'}), 404
 
-        script_path = script.path
-        if not os.path.exists(script_path):
+        if not os.path.exists(script.path):
             return jsonify({'success': False, 'message': '脚本文件不存在'}), 404
 
-        # 生成测试ID
-        test_id = str(uuid.uuid4())
+        # 准备测试配置
+        config = {
+            'vus': data.get('vus', 1),
+            'duration': data.get('duration', 30),
+            'ramp_time': data.get('ramp_time', 0)
+        }
 
         # 启动测试
-        success = k6_manager.start_test(script_path, test_id, vus, duration, ramp_time)
-        if success:
+        test_id, process = k6_manager.start_test(script_id, config)
+        
+        if process:
             return jsonify({
                 'success': True,
                 'message': '测试已启动',
@@ -340,18 +383,21 @@ def stop_test():
         logger.error(f'停止测试失败: {str(e)}')
         return jsonify({'success': False, 'message': str(e)}), 500
 
+@socketio.on('connect', namespace='/ws/metrics')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect', namespace='/ws/metrics')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('join', namespace='/ws/metrics')
+def handle_join(test_id):
+    k6_monitor.add_websocket_client(request.sid)
+    emit('joined', {'test_id': test_id})
+
 # 主程序入口
 if __name__ == '__main__':
-    # 初始化数据库
-    with app.app_context():
-        try:
-            logger.info('正在初始化数据库...')
-            db.create_all()
-            logger.info('数据库表已成功初始化')
-        except Exception as e:
-            logger.error(f'数据库初始化失败: {str(e)}', exc_info=True)
-            sys.exit(1)
-
     # 启动服务器
     port = int(os.getenv('FLASK_PORT', 5001))
     logger.info(f'服务器正在启动，监听端口: {port}')

@@ -10,6 +10,7 @@ class Script(db.Model):
     filename = db.Column(db.String(255), nullable=False)
     path = db.Column(db.String(255), nullable=False)
     description = db.Column(db.Text)
+    dependencies = db.Column(db.JSON)
     created_at = db.Column(db.DateTime, default=datetime.now)
     updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     

@@ -578,7 +578,8 @@ class K6Manager:
                         'min_duration': float('inf'),
                         'max_duration': 0,
                         'avg_duration': 0,
-                        'status_codes': {}
+                        'status_codes': {},
+                        'response_times': []  # 用于存储所有响应时间值，计算90%响应时间
                     }
                 
                 endpoint = metrics['endpoints'][endpoint_key]
@@ -600,6 +601,8 @@ class K6Manager:
                     endpoint['total_duration'] += metric_value
                     endpoint['min_duration'] = min(endpoint['min_duration'], metric_value)
                     endpoint['max_duration'] = max(endpoint['max_duration'], metric_value)
+                    # 保存响应时间值，用于计算90%响应时间
+                    endpoint['response_times'].append(metric_value)
                     if endpoint['requests'] > 0:
                         endpoint['avg_duration'] = endpoint['total_duration'] / endpoint['requests']
                 
@@ -658,24 +661,46 @@ class K6Manager:
             self.logger.exception(e)
 
     def _broadcast_metrics(self, test_id, progress, metrics):
-        """广播指标数据"""
+        """广播测试指标"""
         try:
-            # 确保进度是有效的数值
-            progress = round(float(progress), 1)
-            progress = max(0, min(100, progress))
-
-            # 计算每秒请求数 (RPS)
-            current_time = time.time()
-            test_duration = current_time - metrics.get('start_time', current_time)
+            # 计算并格式化指标
+            test_duration = max(0.001, (time.time() - metrics.get('start_time', time.time())))
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
             
-            # 使用总测试时长计算平均RPS，避免短时间内的RPS波动
-            if test_duration > 0:
-                rps = metrics.get('total_requests', 0) / test_duration
-            else:
-                rps = 0
+            # 计算RPS (限制最大值为1000，避免不合理的数值)
+            rps = min(1000, metrics.get('total_requests', 0) / test_duration)
+            
+            # 转换端点数据
+            endpoints_data = []
+            for endpoint, data in metrics.get('endpoints', {}).items():
+                requests = data.get('requests', 0)
+                failures = data.get('failed', 0)
                 
-            # 限制最大 RPS 显示值为一个合理的值，避免显示异常
-            rps = min(round(rps, 2), 1000)  # 限制最大RPS为1000，更合理
+                # 计算90%响应时间
+                p90_response_time = 0
+                if data.get('response_times'):
+                    # 对响应时间进行排序
+                    sorted_times = sorted(data['response_times'])
+                    # 计算90%位置的索引
+                    idx = int(len(sorted_times) * 0.9)
+                    if idx < len(sorted_times):
+                        p90_response_time = sorted_times[idx]
+                
+                endpoints_data.append({
+                    'endpoint': endpoint,
+                    'requests': requests,
+                    'failures': failures,
+                    'failureRate': failures / max(1, requests),
+                    'avgResponseTime': data.get('avg_duration', 0),
+                    'minResponseTime': data.get('min_duration', 0) if data.get('min_duration', 0) != float('inf') else 0,
+                    'maxResponseTime': data.get('max_duration', 0),
+                    'statusCodes': data.get('status_codes', {}),
+                    'p90ResponseTime': p90_response_time  # 添加90%响应时间
+                })
+            
+            # 按请求数量排序，显示最常用的端点在前面
+            endpoints_data.sort(key=lambda x: x['requests'], reverse=True)
+
             # 构建广播数据
             data = {
                 'test_id': test_id,
@@ -689,36 +714,8 @@ class K6Manager:
                     'total_requests': int(metrics.get('total_requests', 0)),
                     'failed_requests': int(metrics.get('failed_requests', 0))
                 },
-                'endpoints': []
+                'endpoints': endpoints_data
             }
-
-            # 处理端点数据
-            if 'endpoints' in metrics and metrics['endpoints']:
-                for endpoint_name, endpoint_metrics in metrics['endpoints'].items():
-                    # 处理无效的最小响应时间
-                    if endpoint_metrics['min_duration'] == float('inf'):
-                        endpoint_metrics['min_duration'] = 0
-                        
-                    # 计算端点的错误率
-                    total_requests = endpoint_metrics['requests']
-                    failed_requests = endpoint_metrics['failed']
-                    error_rate = (failed_requests / total_requests * 100) if total_requests > 0 else 0
-                    
-                    # 格式化端点数据
-                    endpoint_item = {
-                        'name': endpoint_name,
-                        'requests': endpoint_metrics['requests'],
-                        'failed': endpoint_metrics['failed'],
-                        'error_rate': round(error_rate, 2),
-                        'avg_duration': round(endpoint_metrics['avg_duration'], 2),
-                        'min_duration': round(endpoint_metrics['min_duration'], 2),
-                        'max_duration': round(endpoint_metrics['max_duration'], 2),
-                        'status_codes': endpoint_metrics['status_codes']
-                    }
-                    data['endpoints'].append(endpoint_item)
-                
-                # 按请求数量排序，显示最常用的端点在前面
-                data['endpoints'].sort(key=lambda x: x['requests'], reverse=True)
 
             # 广播数据
             self.monitor.broadcast_metrics(test_id, data)

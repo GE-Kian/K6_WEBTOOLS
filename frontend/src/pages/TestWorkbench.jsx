@@ -23,10 +23,24 @@ const TestWorkbench = () => {
   const [selectedScriptId, setSelectedScriptId] = useState(null);
 
   // 测试监控相关状态
+  const [socket, setSocket] = useState(null);
+  const [socketConnected, setSocketConnected] = useState(false);
   const [testStatus, setTestStatus] = useState('idle');
   const [testProgress, setTestProgress] = useState(0);
+  const [testRunning, setTestRunning] = useState(false);
+  const [currentTestId, setCurrentTestId] = useState(null);
+  const [testMetrics, setTestMetrics] = useState({});
+  const [endpointMetrics, setEndpointMetrics] = useState([]);
+  const [testReportUrl, setTestReportUrl] = useState('');
   const [testError, setTestError] = useState(null);
-  const [testReportUrl, setTestReportUrl] = useState(null); // 添加测试报告URL状态
+  const [loading, setLoading] = useState(false);
+  const [chartData, setChartData] = useState({
+    timestamps: [],
+    rps: [],
+    responseTime: [],
+    errorRate: [],
+    vus: []
+  });
   const [metrics, setMetrics] = useState({
     totalRequests: 0,
     failureRate: 0,
@@ -34,32 +48,8 @@ const TestWorkbench = () => {
     avgResponseTime: 0,
     vus: 0
   });
-  const [endpointMetrics, setEndpointMetrics] = useState([]); // 添加endpointMetrics状态
   const rpsChartRef = useRef(null);
-  const responseTimeChartRef = useRef(null);
   const rpsChart = useRef(null);
-  const responseTimeChart = useRef(null);
-  const [socket, setSocket] = useState(null);
-
-  const [loading, setLoading] = useState(false);
-  const [currentTestId, setCurrentTestId] = useState(null);
-
-  // 添加新的状态
-  const [testRunning, setTestRunning] = useState(false);
-
-  // 定义状态变量
-  const [testMetrics, setTestMetrics] = useState({
-    progress: 0,
-    vus: 0,
-    rps: 0,
-    response_time: 0,
-    error_rate: 0,
-    total_requests: 0,
-    failed_requests: 0
-  });
-
-  // Socket.IO 连接状态
-  const [socketConnected, setSocketConnected] = useState(false);
 
   // 处理文件上传
   const handleUpload = async () => {
@@ -139,6 +129,10 @@ const TestWorkbench = () => {
       withCredentials: true
     });
 
+    // 设置节流更新间隔（每2秒更新一次图表）
+    let lastUpdateTime = 0;
+    const updateInterval = 2000; // 2秒
+
     socket.on('connect', () => {
       console.log('Socket.IO connected');
       setSocketConnected(true);
@@ -169,16 +163,17 @@ const TestWorkbench = () => {
         // 更新接口指标数据
         if (data.endpoints && Array.isArray(data.endpoints)) {
           const formattedEndpoints = data.endpoints.map(endpoint => ({
-            key: endpoint.name,
-            endpoint: endpoint.name,
+            key: endpoint.name || endpoint.endpoint,
+            endpoint: endpoint.name || endpoint.endpoint,
             requests: endpoint.requests,
-            failures: endpoint.failed,
-            failureRate: endpoint.error_rate / 100, // 转换为小数
+            failures: endpoint.failed || endpoint.failures,
+            failureRate: endpoint.error_rate || endpoint.failureRate,
             rps: endpoint.requests / (data.test_duration || 30), // 估计RPS
-            avgResponseTime: endpoint.avg_duration,
-            minResponseTime: endpoint.min_duration,
-            maxResponseTime: endpoint.max_duration,
-            statusCodes: endpoint.status_codes
+            avgResponseTime: endpoint.avg_duration || endpoint.avgResponseTime,
+            minResponseTime: endpoint.min_duration || endpoint.minResponseTime,
+            maxResponseTime: endpoint.max_duration || endpoint.maxResponseTime,
+            p90ResponseTime: endpoint.p90ResponseTime,
+            statusCodes: endpoint.status_codes || endpoint.statusCodes
           }));
           // Sort the formatted endpoints by requests in descending order
           const sortedEndpoints = formattedEndpoints.sort((a, b) => b.requests - a.requests);
@@ -186,12 +181,44 @@ const TestWorkbench = () => {
           console.log('Updated endpoint metrics:', sortedEndpoints);
         }
         
-        // 更新图表数据
-        updateCharts(data.metrics);
+        // 直接更新图表数据
+        if (rpsChart.current) {
+          // 确保所有数值有效
+          const now = new Date().getTime();
+          const rps = parseFloat(data.metrics.rps || 0);
+          const responseTime = parseFloat(data.metrics.response_time || 0);
+          const errorRate = parseFloat(data.metrics.error_rate || 0);
+          const vus = parseInt(data.metrics.vus || 0);
+          
+          console.log(`图表更新: RPS=${rps}, RT=${responseTime}ms, ErrorRate=${errorRate}%, VUs=${vus}`);
+          
+          // 保存当前数据到图表数据集合
+          const series = rpsChart.current.getOption().series;
+          
+          // 更新每个系列的数据
+          series[0].data.push([now, rps]);
+          series[1].data.push([now, responseTime]);
+          series[2].data.push([now, errorRate]);
+          series[3].data.push([now, vus]);
+          
+          // 获取所有时间戳
+          const allTimestamps = series[0].data.map(item => item[0]);
+          const minTime = Math.min(...allTimestamps);
+          const maxTime = Math.max(...allTimestamps);
+          
+          // 更新图表
+          rpsChart.current.setOption({
+            series: series,
+            xAxis: [{
+              min: minTime,
+              max: maxTime
+            }]
+          });
+        }
         
         // 更新进度
         if (data.progress !== undefined) {
-          setTestProgress(parseFloat(data.progress || 0));
+          setTestProgress(parseFloat(data.progress || 0).toFixed(2));
         }
         
         // 更新测试状态
@@ -218,10 +245,10 @@ const TestWorkbench = () => {
         
         // 确保进度数据被正确处理
         if (data.progress !== undefined) {
-          setTestProgress(parseFloat(data.progress || 0).toFixed(1));
+          setTestProgress(parseFloat(data.progress || 0).toFixed(2));
         } else if (newStatus === 'completed' || newStatus === 'stopped') {
           // 如果测试完成或停止，确保进度显示为100%
-          setTestProgress('100.0');
+          setTestProgress('100.00');
         }
         
         // 处理错误信息
@@ -282,6 +309,12 @@ const TestWorkbench = () => {
               overflow: 'truncate'
             }
           },
+          toolbox: {
+            feature: {
+              saveAsImage: {}
+            },
+            right: '4%'
+          },
           grid: {
             left: '3%',
             right: '4%',
@@ -292,10 +325,11 @@ const TestWorkbench = () => {
           xAxis: [{
             type: 'time',
             boundaryGap: false,
+            axisLine: { onZero: false },
             axisLabel: {
-              formatter: (value) => {
+              formatter: function(value) {
                 const date = new Date(value);
-                return date.toLocaleTimeString('zh-CN', { hour12: false });
+                return `${date.getHours()}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}`;
               },
               hideOverlap: true
             }
@@ -398,60 +432,145 @@ const TestWorkbench = () => {
     };
   }, []);
 
-  // 更新图表数据
-  const updateCharts = (metricsData) => {
+  // stopTest 函数
+  const stopTest = async () => {
+    if (!currentTestId) return;
+
+    try {
+      setLoading(true);
+      const response = await axios.post(getApiUrl(API_ENDPOINTS.STOP_TEST), {
+        test_id: currentTestId
+      });
+
+      message.success('测试已停止');
+      setTestRunning(false);
+      setCurrentTestId(null);
+      setTestStatus('stopped');
+      setTestProgress('100.00');
+    } catch (error) {
+      console.error('Error:', error);
+      message.error('停止测试失败: ' + (error.response?.data?.error || error.message));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 更新图表显示
+  const updateChartDisplay = () => {
     if (!rpsChart.current) {
       console.warn('RPS chart not initialized');
       return;
     }
     
     try {
-      const now = new Date().getTime();
+      // 确保有数据才更新图表
+      if (chartData.timestamps.length === 0) {
+        return;
+      }
       
-      // 确保所有数值有效
-      const rps = parseFloat(metricsData.rps || 0);
-      const responseTime = parseFloat(metricsData.response_time || 0);
-      const errorRate = parseFloat(metricsData.error_rate || 0);
-      const vus = parseInt(metricsData.vus || 0);
-      
-      console.log(`Updating chart with: RPS=${rps}, RT=${responseTime}ms, ErrorRate=${errorRate}%, VUs=${vus}`);
-      
-      const series = rpsChart.current.getOption().series.map((item, index) => {
-        let value = 0;
-        switch (index) {
-          case 0: // RPS
-            value = rps;
-            break;
-          case 1: // Response Time
-            value = responseTime;
-            break;
-          case 2: // Error Rate
-            value = errorRate;
-            break;
-          case 3: // VUs
-            value = vus;
-            break;
-          default:
-            value = 0;
+      // 创建符合ECharts要求的数据格式
+      const seriesData = [
+        {
+          name: '每秒接口请求数',
+          type: 'line',
+          smooth: true,
+          data: chartData.timestamps.map((timestamp, index) => [timestamp, chartData.rps[index]]),
+          itemStyle: { color: '#FF6B6B' },
+          yAxisIndex: 0
+        },
+        {
+          name: '平均响应时间',
+          type: 'line',
+          smooth: true,
+          data: chartData.timestamps.map((timestamp, index) => [timestamp, chartData.responseTime[index]]),
+          itemStyle: { color: '#4ECDC4' },
+          yAxisIndex: 1
+        },
+        {
+          name: '请求失败率',
+          type: 'line',
+          smooth: true,
+          data: chartData.timestamps.map((timestamp, index) => [timestamp, chartData.errorRate[index]]),
+          itemStyle: { color: '#FFE66D' },
+          yAxisIndex: 2
+        },
+        {
+          name: '并发用户数',
+          type: 'line',
+          smooth: true,
+          data: chartData.timestamps.map((timestamp, index) => [timestamp, chartData.vus[index]]),
+          itemStyle: { color: '#95A5A6' },
+          yAxisIndex: 0
         }
-        
-        const seriesData = [...(item.data || [])];
-        seriesData.push([now, value]);
-        
-        // 保持最多100个数据点
-        while (seriesData.length > 100) {
-          seriesData.shift();
-        }
-        
-        return {
-          ...item,
-          data: seriesData
-        };
+      ];
+      
+      // 计算各指标的最大值，动态调整Y轴范围
+      const maxRps = Math.max(...chartData.rps, 1);
+      const maxVus = Math.max(...chartData.vus, 1);
+      const maxResponseTime = Math.max(...chartData.responseTime, 1);
+      
+      // 设置X轴范围为所有数据点的时间范围
+      const minTime = Math.min(...chartData.timestamps);
+      const maxTime = Math.max(...chartData.timestamps);
+      
+      // 更新图表配置
+      rpsChart.current.setOption({
+        series: seriesData,
+        xAxis: [{
+          type: 'time',
+          boundaryGap: false,
+          axisLine: { onZero: false },
+          axisLabel: {
+            formatter: function(value) {
+              const date = new Date(value);
+              return `${date.getHours()}:${date.getMinutes().toString().padStart(2, '0')}:${date.getSeconds().toString().padStart(2, '0')}`;
+            },
+            hideOverlap: true
+          },
+          min: minTime,
+          max: maxTime
+        }],
+        yAxis: [
+          {
+            type: 'value',
+            name: '请求数/用户数',
+            nameLocation: 'middle',
+            nameGap: 50,
+            position: 'left',
+            axisLabel: {
+              hideOverlap: true
+            },
+            max: Math.ceil(Math.max(maxRps, maxVus) * 1.1)
+          },
+          {
+            type: 'value',
+            name: '响应时间(ms)',
+            nameLocation: 'middle',
+            nameGap: 50,
+            position: 'right',
+            offset: 0,
+            axisLabel: {
+              hideOverlap: true
+            },
+            max: Math.ceil(maxResponseTime * 1.1)
+          },
+          {
+            type: 'value',
+            name: '失败率(%)',
+            nameLocation: 'middle',
+            nameGap: 50,
+            position: 'right',
+            offset: 80,
+            max: 100,
+            min: 0,
+            axisLabel: {
+              hideOverlap: true
+            }
+          }
+        ]
       });
-
-      rpsChart.current.setOption({ series });
     } catch (error) {
-      console.error('Error updating charts:', error);
+      console.error('Error updating chart display:', error);
     }
   };
 
@@ -491,11 +610,54 @@ const TestWorkbench = () => {
       });
       setEndpointMetrics([]); // 重置接口指标
       
+      // 重置图表数据和历史记录
+      setChartData({
+        timestamps: [],
+        rps: [],
+        responseTime: [],
+        errorRate: [],
+        vus: []
+      });
+      
       // 清空图表数据
       if (rpsChart.current) {
-        const option = rpsChart.current.getOption();
-        option.series.forEach(series => series.data = []);
-        rpsChart.current.setOption(option);
+        // 清空图表
+        rpsChart.current.setOption({
+          series: [
+            { 
+              name: '每秒接口请求数',
+              type: 'line',
+              smooth: true,
+              data: [],
+              itemStyle: { color: '#FF6B6B' },
+              yAxisIndex: 0
+            },
+            { 
+              name: '平均响应时间',
+              type: 'line',
+              smooth: true,
+              data: [],
+              itemStyle: { color: '#4ECDC4' },
+              yAxisIndex: 1
+            },
+            { 
+              name: '请求失败率',
+              type: 'line',
+              smooth: true,
+              data: [],
+              itemStyle: { color: '#FFE66D' },
+              yAxisIndex: 2
+            },
+            { 
+              name: '并发用户数',
+              type: 'line',
+              smooth: true,
+              data: [],
+              itemStyle: { color: '#95A5A6' },
+              yAxisIndex: 0
+            }
+          ]
+        });
       }
 
       const response = await axios.post(getApiUrl(API_ENDPOINTS.START_TEST), {
@@ -514,29 +676,6 @@ const TestWorkbench = () => {
       console.error('Error:', error);
       setTestError(error.response?.data?.error || error.message);
       message.error('启动测试失败: ' + (error.response?.data?.error || error.message));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // 更新 stopTest 函数
-  const stopTest = async () => {
-    if (!currentTestId) return;
-
-    try {
-      setLoading(true);
-      const response = await axios.post(getApiUrl(API_ENDPOINTS.STOP_TEST), {
-        test_id: currentTestId
-      });
-
-      message.success('测试已停止');
-      setTestRunning(false);
-      setCurrentTestId(null);
-      setTestStatus('stopped');
-      setTestProgress(100);
-    } catch (error) {
-      console.error('Error:', error);
-      message.error('停止测试失败: ' + (error.response?.data?.error || error.message));
     } finally {
       setLoading(false);
     }
@@ -694,35 +833,12 @@ const TestWorkbench = () => {
         render: value => `${parseFloat(value || 0).toFixed(2)} ms`
       },
       {
-        title: '状态码分布',
-        dataIndex: 'statusCodes',
-        key: 'statusCodes',
+        title: '90%响应时间',
+        dataIndex: 'p90ResponseTime',
+        key: 'p90ResponseTime',
         width: '18%',
-        render: (statusCodes) => {
-          if (!statusCodes || Object.keys(statusCodes).length === 0) {
-            return '-';
-          }
-          
-          // 为不同状态码添加颜色
-          const statusItems = Object.entries(statusCodes).map(([code, count]) => {
-            let color = 'default';
-            if (code.startsWith('2')) {
-              color = 'success';
-            } else if (code.startsWith('4')) {
-              color = 'warning';
-            } else if (code.startsWith('5')) {
-              color = 'error';
-            }
-            
-            return (
-              <Tag color={color} key={code} style={{ marginRight: '5px', marginBottom: '5px' }}>
-                {code}: {count}
-              </Tag>
-            );
-          });
-          
-          return <div style={{ display: 'flex', flexWrap: 'wrap' }}>{statusItems}</div>;
-        }
+        sorter: (a, b) => a.p90ResponseTime - b.p90ResponseTime,
+        render: value => `${parseFloat(value || 0).toFixed(2)} ms`
       }
     ];
 

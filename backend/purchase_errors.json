@@ -1,0 +1,9 @@
+{
+  "timestamp": "2025-03-13T07:39:09.216Z",
+  "total_errors": 0,
+  "error_details": [],
+  "test_info": {
+      "duration_ms": 42000.4766,
+      "vus_max": 2
+    }
+}

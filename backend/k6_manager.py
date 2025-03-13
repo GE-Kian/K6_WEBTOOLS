@@ -2,29 +2,38 @@ import os
 import json
 import subprocess
 import logging
+import re
+import io
+import shutil
+import uuid
+import math
+import errno
 from datetime import datetime
 import threading
 import time
 import queue
 from threading import Thread, Event
-import errno
-import re
-import io
-import shutil
-from flask import request, current_app
+import tempfile
+import urllib.parse
+
+from flask import request, current_app as app
 from models import db, Script, TestResult, PerformanceMetric
 from broadcast import broadcast_metrics, broadcast_test_status
 
 logger = logging.getLogger(__name__)
 
+
 class K6MonitorService:
-    # 定义可能的状态
+    """
+    K6 测试监控服务，负责监控和管理测试状态
+    """
+    # 定义状态常量
     STATUS_IDLE = 'idle'
     STATUS_RUNNING = 'running'
     STATUS_STOPPED = 'stopped'
     STATUS_ERROR = 'error'
-    STATUS_FAILED = 'failed'  # 添加失败状态
-    STATUS_PAUSED = 'paused'  # 添加暂停状态
+    STATUS_FAILED = 'failed'
+    STATUS_PAUSED = 'paused'
 
     # 定义有效的状态转换
     _VALID_TRANSITIONS = {
@@ -37,883 +46,862 @@ class K6MonitorService:
     }
 
     def __init__(self):
-        self.current_test = None
-        self.websocket_clients = set()
+        """初始化监控服务"""
         self.status = self.STATUS_IDLE
-        self._lock = threading.Lock()
-        self._metrics_buffer = []
-        self._last_broadcast_time = 0
-        self._broadcast_interval = 1.0  # 广播间隔（秒）
-        self._error_message = None
-        self._start_time = None
-        self._last_activity_time = None
-        self._max_inactive_time = 300  # 最大不活动时间（秒）
-        self._metrics_count = 0
-        self._error_count = 0
-        self._last_error = None
-        self._status_history = []  # 状态历史记录
-        self._pause_time = None  # 暂停时间
-        self._total_pause_duration = 0  # 总暂停时间
-        self._retry_count = 0  # 重试次数
-        self._max_retries = 3  # 最大重试次数
-
-    def _record_status_change(self, old_status, new_status, error_message=None):
-        """记录状态变化"""
-        status_record = {
-            'timestamp': datetime.now().isoformat(),
-            'old_status': old_status,
-            'new_status': new_status,
-            'test_id': self.current_test,
-            'error_message': error_message,
-            'metrics_count': self._metrics_count,
-            'error_count': self._error_count,
-            'clients_count': len(self.websocket_clients)
-        }
-        if self._start_time:
-            status_record['running_time'] = time.time() - self._start_time - self._total_pause_duration
-        
-        self._status_history.append(status_record)
-        return status_record
-
-    def _can_transition_to(self, new_status):
-        """检查是否可以转换到新状态"""
-        if new_status == self.status:
-            return True  # 允许相同状态的转换
-        
-        # 检查是否超过最大重试次数
-        if self._retry_count >= self._max_retries and new_status == self.STATUS_RUNNING:
-            logger.warning(f'已达到最大重试次数 ({self._max_retries})，无法重新启动')
-            return False
-            
-        return new_status in self._VALID_TRANSITIONS.get(self.status, [])
-
-    def _set_status(self, new_status, error_message=None):
-        """安全地设置新状态"""
-        if not self._can_transition_to(new_status):
-            logger.warning(f'无效的状态转换: {self.status} -> {new_status}')
-            return False
-        
-        old_status = self.status
-        self.status = new_status
-        
-        # 更新错误信息
-        if error_message:
-            self._last_error = error_message
-            if new_status in [self.STATUS_ERROR, self.STATUS_FAILED]:
-                self._error_message = error_message
-                self._error_count += 1
-        elif new_status not in [self.STATUS_ERROR, self.STATUS_FAILED]:
-            self._error_message = None
-        
-        # 更新状态相关的时间戳
-        self._last_activity_time = time.time()
-        if new_status == self.STATUS_PAUSED:
-            self._pause_time = time.time()
-        elif old_status == self.STATUS_PAUSED and new_status == self.STATUS_RUNNING:
-            if self._pause_time:
-                self._total_pause_duration += time.time() - self._pause_time
-                self._pause_time = None
-        
-        # 更新重试计数
-        if old_status in [self.STATUS_ERROR, self.STATUS_FAILED] and new_status == self.STATUS_RUNNING:
-            self._retry_count += 1
-        elif new_status == self.STATUS_IDLE:
-            self._retry_count = 0
-        
-        # 记录状态变化
-        status_info = self._record_status_change(old_status, new_status, error_message)
-        logger.info(f'状态转换: {status_info}')
-        return True
-
-    def _handle_error(self, error_message, is_fatal=False):
-        """统一处理错误"""
-        if is_fatal:
-            new_status = self.STATUS_FAILED
-        else:
-            new_status = self.STATUS_ERROR
-            
-        self._set_status(new_status, error_message)
-        logger.error(f'测试错误 ({new_status}): {error_message}')
-        
-        # 如果是致命错误，清理资源
-        if is_fatal:
-            self._cleanup_resources()
-            self._set_status(self.STATUS_IDLE)
-
-    def _cleanup_resources(self):
-        """清理资源"""
-        self.current_test = None
-        self._metrics_buffer.clear()
-        self.websocket_clients.clear()
-        self._reset_metrics()
-
-    def _check_inactive_timeout(self):
-        """检查是否超过最大不活动时间"""
-        if (self.status == self.STATUS_RUNNING and 
-            self._last_activity_time and 
-            time.time() - self._last_activity_time > self._max_inactive_time):
-            error_msg = f'测试 {self.current_test} 超过 {self._max_inactive_time} 秒未收到数据'
-            logger.warning(error_msg)
-            self._set_status(self.STATUS_ERROR, error_msg)
-            return True
-        return False
-
-    def _reset_metrics(self):
-        """重置指标相关的计数器"""
-        self._metrics_count = 0
-        self._error_count = 0
-        self._metrics_buffer.clear()
-        self._last_broadcast_time = 0
-        self._start_time = None
-        self._last_activity_time = None
+        self.current_test_id = None
+        self.monitor_thread = None
+        self.stop_event = Event()
+        self.metrics_queue = queue.Queue()
+        self.last_metrics = {}
 
     def start_monitoring(self, test_id):
-        with self._lock:
-            if self.status == self.STATUS_RUNNING:
-                logger.warning(f'已有测试正在运行: {self.current_test}，无法启动新测试: {test_id}')
-                return False
-            
-            try:
-                if not self._set_status(self.STATUS_RUNNING):
-                    return False
-                
-                self.current_test = test_id
-                self._metrics_buffer.clear()
-                self._last_broadcast_time = time.time()
-                self._start_time = time.time()
-                logger.info(f'开始监控测试: {test_id}')
-                return True
-            except Exception as e:
-                error_msg = f'启动监控时发生错误: {str(e)}'
-                self._set_status(self.STATUS_ERROR, error_msg)
-                logger.error(error_msg)
-                return False
+        """
+        启动监控
+        
+        Args:
+            test_id: 测试ID
+        """
+        if self.status == self.STATUS_RUNNING:
+            logger.warning(f'Monitor already running for test: {self.current_test_id}')
+            return False
+
+        # 设置状态
+        self._transition_to(self.STATUS_RUNNING)
+        self.current_test_id = test_id
+        self.stop_event.clear()
+
+        # 启动监控线程
+        self.monitor_thread = Thread(target=self._monitor_loop)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+
+        logger.info(f'Started monitoring for test: {test_id}')
+        return True
 
     def stop_monitoring(self):
         """停止监控"""
-        with self._lock:
-            if not self.current_test:
-                logger.warning('没有正在运行的测试')
-                return False
-
-            try:
-                prev_test = self.current_test
-                prev_status = self.status
-                
-                # 如果当前状态是失败状态，直接清理资源
-                if self.status in [self.STATUS_ERROR, self.STATUS_FAILED]:
-                    self._cleanup_resources()
-                    self._set_status(self.STATUS_IDLE)
-                    logger.info(f'清理失败的测试: {prev_test} (之前状态: {prev_status})')
-                    return True
-                
-                # 正常停止流程
-                if not self._set_status(self.STATUS_STOPPED):
-                    return False
-                
-                self._cleanup_resources()
-                logger.info(f'停止监控测试: {prev_test}')
-                
-                # 自动转换到空闲状态
-                self._set_status(self.STATUS_IDLE)
-                return True
-            except Exception as e:
-                error_msg = f'停止监控时发生错误: {str(e)}'
-                self._handle_error(error_msg, is_fatal=True)
-                return False
-        
-    def add_websocket_client(self, ws):
-        with self._lock:
-            if ws not in self.websocket_clients:
-                self.websocket_clients.add(ws)
-                logger.info(f'添加WebSocket客户端: {ws}, 当前连接数: {len(self.websocket_clients)}')
-                return True
+        if self.status != self.STATUS_RUNNING:
             return False
+
+        # 设置停止事件
+        self.stop_event.set()
+
+        # 等待线程结束
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=5)
+
+        # 设置状态
+        self._transition_to(self.STATUS_STOPPED)
+        self.current_test_id = None
+
+        logger.info('Stopped monitoring')
+        return True
+
+    def _monitor_loop(self):
+        """监控循环"""
+        try:
+            while not self.stop_event.is_set():
+                # 检查测试状态
+                if self.current_test_id:
+                    # 处理队列中的指标
+                    self._process_metrics_queue()
+
+                # 等待一段时间
+                self.stop_event.wait(1.0)
+        except Exception as e:
+            logger.error(f'Monitor loop error: {str(e)}')
+            self._transition_to(self.STATUS_ERROR)
+
+    def _process_metrics_queue(self):
+        """处理指标队列"""
+        try:
+            # 处理队列中的所有指标
+            while not self.metrics_queue.empty():
+                metric = self.metrics_queue.get_nowait()
+                self.last_metrics[metric['name']] = metric['value']
+                # 可以在这里添加更多处理逻辑
+        except queue.Empty:
+            pass
+        except Exception as e:
+            logger.error(f'Error processing metrics queue: {str(e)}')
+
+    def _transition_to(self, new_status):
+        """
+        转换状态
         
-    def remove_websocket_client(self, ws):
-        with self._lock:
-            if ws in self.websocket_clients:
-                self.websocket_clients.remove(ws)
-                logger.info(f'移除WebSocket客户端: {ws}, 当前连接数: {len(self.websocket_clients)}')
-                if not self.websocket_clients and self.status == self.STATUS_RUNNING:
-                    logger.warning('所有客户端已断开，但测试仍在运行')
-                return True
+        Args:
+            new_status: 新状态
+        """
+        if new_status not in self._VALID_TRANSITIONS.get(self.status, []):
+            logger.warning(f'Invalid status transition: {self.status} -> {new_status}')
             return False
-        
-    def broadcast_metrics(self, metrics):
-        with self._lock:
-            if not self.current_test:
-                logger.warning('尝试广播指标但没有活动的测试')
-                return False
-            
-            if self.status != self.STATUS_RUNNING:
-                logger.warning(f'测试状态不是运行中 (当前状态: {self.status})')
-                return False
 
-            current_time = time.time()
-            if current_time - self._last_broadcast_time < self._broadcast_interval:
-                self._metrics_buffer.append(metrics)
-                return True
+        self.status = new_status
+        return True
 
-            try:
-                # 如果有缓存的指标，一起发送
-                if self._metrics_buffer:
-                    self._metrics_buffer.append(metrics)
-                    metrics_to_send = self._aggregate_metrics(self._metrics_buffer)
-                    self._metrics_buffer.clear()
-                else:
-                    metrics_to_send = metrics
 
-                broadcast_metrics(self.current_test, metrics_to_send)
-                self._last_broadcast_time = current_time
-                logger.debug(f'成功广播测试 {self.current_test} 的指标')
-                return True
-            except Exception as e:
-                logger.error(f'广播指标失败: {str(e)}')
-                self.status = self.STATUS_ERROR
-                return False
+class K6Monitor:
+    def __init__(self):
+        self.clients = set()
+        self.logger = logging.getLogger('k6_manager')
 
-    def _aggregate_metrics(self, metrics_list):
-        """聚合多个指标"""
-        if not metrics_list:
-            return {}
-        
-        # 使用最后一个指标作为基础
-        aggregated = metrics_list[-1].copy()
-        
-        # 计算平均值的字段
-        avg_fields = ['avgResponseTime', 'currentRPS', 'failureRate']
-        for field in avg_fields:
-            values = [m.get(field, 0) for m in metrics_list if field in m]
-            if values:
-                aggregated[field] = sum(values) / len(values)
-        
-        # 累加字段
-        sum_fields = ['totalRequests']
-        for field in sum_fields:
-            values = [m.get(field, 0) for m in metrics_list if field in m]
-            if values:
-                aggregated[field] = max(values)  # 使用最大值作为累计值
-        
-        return aggregated
-
-    def get_status_history(self):
-        """获取状态历史记录"""
-        with self._lock:
-            return self._status_history.copy()
-
-    def get_effective_running_time(self):
-        """获取有效运行时间（不包括暂停时间）"""
-        with self._lock:
-            if not self._start_time:
-                return 0
-            total_time = time.time() - self._start_time
-            return max(0, total_time - self._total_pause_duration)
-
-    def get_status(self):
-        """获取当前状态的详细信息"""
-        with self._lock:
-            status_info = {
-                'test_id': self.current_test,
-                'status': self.status,
-                'clients_count': len(self.websocket_clients),
-                'metrics_buffer_size': len(self._metrics_buffer),
-                'metrics_count': self._metrics_count,
-                'error_count': self._error_count,
-                'last_broadcast': self._last_broadcast_time,
-                'retry_count': self._retry_count,
-                'max_retries': self._max_retries
-            }
-            
-            if self._start_time:
-                status_info['total_running_time'] = time.time() - self._start_time
-                status_info['effective_running_time'] = self.get_effective_running_time()
-            
-            if self._error_message:
-                status_info['error_message'] = self._error_message
+    def broadcast_metrics(self, test_id, data):
+        """广播测试指标数据"""
+        try:
+            # 确保数据格式正确
+            if isinstance(data, dict):
+                # 添加必要的字段
+                data['test_id'] = test_id
+                data['timestamp'] = datetime.now().isoformat()
                 
-            if self._last_activity_time:
-                status_info['inactive_time'] = time.time() - self._last_activity_time
+                # 导入broadcast模块的函数来发送消息
+                from broadcast import broadcast_metrics
                 
-            if self._pause_time:
-                status_info['pause_duration'] = time.time() - self._pause_time
+                self.logger.info(f"Broadcasting metrics via Socket.IO - Test ID: {test_id}")
+                self.logger.debug(f"Broadcast data: {data}")
                 
-            return status_info
+                # 使用broadcast模块的函数发送数据
+                broadcast_metrics(data)
+            else:
+                self.logger.error(f"Invalid data format for broadcasting: {data}")
+                
+        except Exception as e:
+            self.logger.error(f"Error broadcasting metrics: {str(e)}")
+            self.logger.exception(e)
 
-k6_monitor = K6MonitorService()
 
 class K6Manager:
-    def __init__(self, app=None):
+    # 定义状态常量
+    STATUS_PENDING = 'pending'
+    STATUS_RUNNING = 'running'
+    STATUS_COMPLETED = 'completed'
+    STATUS_FAILED = 'failed'
+    STATUS_STOPPED = 'stopped'
+    STATUS_ERROR = 'error'
+
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(K6Manager, cls).__new__(cls)
+            cls._instance.initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self.initialized:
+            return
+            
+        self.app = None
+        self.k6_path = 'k6'  # 直接使用k6命令
+        self.scripts_dir = 'scripts'
+        self.reports_dir = 'reports'
+        self.active_tests = {}
+        self.logger = logging.getLogger('k6_manager')
+        self.monitor = K6Monitor()
+        self.initialized = True
+        self.encoding = 'utf-8'
+
+    def init_app(self, app, k6_path=None, scripts_dir=None, reports_dir=None):
+        """初始化应用配置"""
         self.app = app
-        self.scripts_dir = os.getenv('K6_SCRIPTS_DIR', 'scripts')
-        self.reports_dir = os.getenv('K6_REPORTS_DIR', 'reports')
-        self.running_tests = {}
-        self.test_metrics = {}
+        if k6_path:
+            self.k6_path = k6_path
+        if scripts_dir:
+            self.scripts_dir = scripts_dir
+        if reports_dir:
+            self.reports_dir = reports_dir
         
-        # 确保目录存在
-        for directory in [self.scripts_dir, self.reports_dir]:
-            os.makedirs(directory, exist_ok=True)
-            if not os.access(directory, os.W_OK):
-                raise PermissionError(f'没有写入权限: {directory}')
-        
-        logger.info(f'K6Manager初始化，脚本目录: {os.path.abspath(self.scripts_dir)}, 报告目录: {os.path.abspath(self.reports_dir)}')
+        self.logger.info(f"K6 Manager initialized with k6_path: {self.k6_path}")
+        self.logger.info(f"K6 Manager initialized with app: scripts_dir={self.scripts_dir}, reports_dir={self.reports_dir}")
 
-    def init_app(self, app):
-        """初始化应用实例"""
-        self.app = app
-
-    def _generate_command(self, script_path, test_id, vus, duration, ramp_time):
-        """生成k6命令"""
-        command = ['k6', 'run', '--out', 'json=-']
-        
-        if ramp_time > 0:
-            command.extend([
-                '--stage', '0s:0',
-                '--stage', f'{ramp_time}s:{vus}',
-                '--stage', f'{duration}s:{vus}'
-            ])
-        else:
-            command.extend([
-                '--vus', str(vus),
-                '--duration', f'{duration}s'
-            ])
-        
-        command.append(script_path)
-        logger.info(f'生成的K6命令: {" ".join(command)}')
-        return command
-
-    def start_test(self, script_id, config):
+    def _create_process(self, cmd):
+        """创建子进程的通用方法"""
         try:
-            # 创建测试记录
-            test_result = TestResult(
-                script_id=script_id,
-                config=json.dumps(config),
-                status='running'
-            )
-            db.session.add(test_result)
-            db.session.commit()
+            # 检查k6命令是否可用
+            try:
+                result = subprocess.run(['k6', 'version'], capture_output=True, text=True)
+                self.logger.info(f"K6版本信息: {result.stdout}")
+            except subprocess.CalledProcessError as e:
+                self.logger.error(f"k6 command check failed: {str(e)}")
+                self.logger.error(f"Error output: {e.stderr}")
+                return None
+            except Exception as e:
+                self.logger.error(f"k6 command not found or not executable: {str(e)}")
+                return None
             
-            # 启动监控
-            k6_monitor.start_monitoring(test_result.id)
-            
-            # 启动测试进程
-            process = self._run_k6_test(script_id, config, test_result)
-            
-            # 初始化测试信息
-            self.running_tests[test_result.id] = {
-                'process': process,
-                'start_time': time.time(),
-                'duration': config.get('duration', 30),
-                'status': 'running',
-                'metrics': {
-                    'http_reqs': 0,
-                    'http_req_duration': 0,
-                    'http_req_failed': 0,
-                    'vus': config.get('vus', 1),
-                    'rps': 0,
-                    'failure_rate': 0
-                },
-                'files': {
-                    'metrics': os.path.join(self.reports_dir, f'{test_result.id}_metrics.json'),
-                    'summary': os.path.join(self.reports_dir, f'{test_result.id}_summary.json')
-                }
-            }
-            
-            return test_result.id, process
-        except Exception as e:
-            logging.error(f"Error starting test: {str(e)}")
-            raise
-
-    def _run_k6_test(self, script_id, config, test_result):
-        """运行k6测试"""
-        try:
-            # 获取脚本信息
-            script = db.session.get(Script, script_id)
-            if not script:
-                raise ValueError(f'Script not found: {script_id}')
-
-            # 检查脚本文件是否存在
-            if not os.path.exists(script.path):
-                raise FileNotFoundError(f'Script file not found: {script.path}')
-
-            # 检查依赖文件
-            script_dir = os.path.dirname(script.path)
-            if hasattr(script, 'dependencies') and script.dependencies:
-                for dep_name, dep_path in script.dependencies.items():
-                    # 确保依赖文件在脚本目录中
-                    local_dep_path = os.path.join(script_dir, os.path.basename(dep_path))
-                    if not os.path.exists(local_dep_path):
-                        logger.warning(f'依赖文件不存在: {local_dep_path}，尝试复制或创建...')
-                        try:
-                            if os.path.exists(dep_path):
-                                # 如果原始依赖文件存在，复制到脚本目录
-                                shutil.copy2(dep_path, local_dep_path)
-                            else:
-                                # 创建新的依赖文件
-                                with open(local_dep_path, 'w', encoding='utf-8') as f:
-                                    f.write(f'// {dep_name} placeholder\n')
-                            logger.info(f'依赖文件已就绪: {local_dep_path}')
-                        except Exception as e:
-                            logger.error(f'处理依赖文件失败: {str(e)}')
-                            raise
-
-            # 构建k6命令
-            command = ['k6', 'run', '--out', 'json=-']
-            
-            # 添加配置参数
-            vus = config.get('vus', 1)
-            duration = config.get('duration', 30)
-            ramp_time = config.get('ramp_time', 0)
-            
-            if ramp_time > 0:
-                # 如果有 ramp_time，使用 stages 模式
-                command.extend([
-                    '--vus', str(vus),
-                    '--stage', f'0s:0',  # 开始时 0 VUs
-                    '--stage', f'{ramp_time}s:{vus}',  # 在 ramp_time 时间内增加到目标 VUs
-                    '--stage', f'{duration}s:{vus}'  # 维持 VUs 直到结束
-                ])
-            else:
-                # 如果没有 ramp_time，使用简单的 vus 和 duration 模式
-                command.extend([
-                    '--vus', str(vus),
-                    '--duration', f'{duration}s'
-                ])
-            
-            # 添加脚本路径
-            command.append(script.path)
-            
-            # 设置环境变量
-            env = os.environ.copy()
-            env['PYTHONIOENCODING'] = 'utf-8'
-            env['LANG'] = 'en_US.UTF-8'
-            env['LC_ALL'] = 'en_US.UTF-8'
-            env['K6_SCRIPT_ROOT'] = script_dir  # 设置脚本根目录
-            
-            logger.info(f'执行k6命令: {" ".join(command)}')
-            logger.info(f'工作目录: {script_dir}')
-            
-            # 启动进程
-            startupinfo = None
-            if os.name == 'nt':  # Windows系统
+            # 处理命令中的路径，确保包含空格的路径被正确引用
+            if os.name == 'nt':  # Windows
+                # Windows下使用列表形式传递命令
+                self.logger.info(f"执行命令: {' '.join(cmd)}")
+                
+                # 使用subprocess.STARTUPINFO来隐藏控制台窗口
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
                 
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                startupinfo=startupinfo,
-                bufsize=-1,  # 使用系统默认缓冲
-                universal_newlines=False,  # 不自动处理换行符
-                cwd=script_dir  # 设置工作目录为脚本所在目录
-            )
+                process_args = {
+                    'args': cmd,
+                    'shell': False,
+                    'stdout': subprocess.PIPE,
+                    'stderr': subprocess.PIPE,
+                    'text': True,
+                    'encoding': self.encoding,
+                    'errors': 'replace',
+                    'bufsize': 1,
+                    'universal_newlines': True,
+                    'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP,
+                    'startupinfo': startupinfo
+                }
+            else:  # Linux/Unix
+                self.logger.info(f"执行命令: {' '.join(cmd)}")
+                process_args = {
+                    'args': cmd,
+                    'shell': False,
+                    'stdout': subprocess.PIPE,
+                    'stderr': subprocess.PIPE,
+                    'text': True,
+                    'encoding': self.encoding,
+                    'errors': 'replace',
+                    'bufsize': 1,
+                    'universal_newlines': True
+                }
             
-            # 启动输出处理线程
-            Thread(
-                target=self._process_test_output,
-                args=(process, test_result.id, self.app),
-                daemon=True
-            ).start()
+            # 创建进程
+            process = subprocess.Popen(**process_args)
             
+            # 检查进程是否成功创建
+            if process.poll() is not None:
+                self.logger.error("进程创建失败，立即退出")
+                error_output = process.stderr.read()
+                if error_output:
+                    self.logger.error(f"错误输出: {error_output}")
+                return None
+                
+            self.logger.info(f"进程创建成功，PID: {process.pid}")
             return process
             
+        except PermissionError as e:
+            self.logger.error(f"权限错误: {str(e)}")
+            self.logger.error("请确保有权限执行k6命令")
+            return None
         except Exception as e:
-            logger.error(f'启动测试失败: {str(e)}')
-            raise
+            self.logger.error(f"创建进程失败: {str(e)}")
+            self.logger.exception(e)
+            return None
 
-    def _process_test_output(self, process, test_id, app):
-        """处理测试输出"""
-        stdout_wrapper = None
-        stderr_wrapper = None
-        error_buffer = []
+    def _read_output(self, pipe, file):
+        """读取进程输出并写入文件"""
         try:
-            with app.app_context():
-                # 使用 io.TextIOWrapper 包装输出流，确保正确的编码处理
-                stdout_wrapper = io.TextIOWrapper(process.stdout, encoding='utf-8', errors='replace', line_buffering=True)
-                stderr_wrapper = io.TextIOWrapper(process.stderr, encoding='utf-8', errors='replace', line_buffering=True)
-                
-                # 创建错误输出读取线程
-                def read_stderr():
-                    while True:
-                        line = stderr_wrapper.readline()
-                        if not line and process.poll() is not None:
-                            break
-                        if line:
-                            error_buffer.append(line.strip())
-                            if 'error' in line.lower():
-                                logger.error(f'K6错误输出: {line.strip()}')
-                
-                error_thread = Thread(target=read_stderr, daemon=True)
-                error_thread.start()
-                
-                while True:
-                    line = stdout_wrapper.readline()
-                    if not line and process.poll() is not None:
-                        break
-                        
-                    if line:
-                        try:
-                            data = json.loads(line.strip())
-                            if data.get('type') == 'Point':
-                                self._process_metrics(test_id, data)
-                        except json.JSONDecodeError:
-                            logger.debug(f'非JSON输出: {line.strip()}')
-                        except Exception as e:
-                            logger.error(f'处理输出行失败: {str(e)}')
-                
-                # 等待错误输出线程结束
-                error_thread.join(timeout=2)
-                
-                # 处理进程结束
-                return_code = process.poll()
-                error_message = None
-                
-                if error_buffer:
-                    # 处理错误信息，去除重复
-                    unique_errors = []
-                    seen = set()
-                    for error in error_buffer:
-                        error_key = error.split('time=')[1] if 'time=' in error else error
-                        if error_key not in seen:
-                            seen.add(error_key)
-                            unique_errors.append(error)
-                    error_message = '\n'.join(unique_errors)
-                
-                if return_code == 0:
-                    self._update_test_status(test_id, 'completed')
-                    logger.info(f'测试 {test_id} 已完成')
-                else:
-                    if not error_message and stderr_wrapper:
-                        error_message = stderr_wrapper.read()
-                    
-                    # 如果是脚本错误，设置为失败状态
-                    if 'ReferenceError' in str(error_message) or 'SyntaxError' in str(error_message):
-                        status = 'failed'
-                    else:
-                        status = 'error'
-                    
-                    self._update_test_status(test_id, status, error_message)
-                    logger.error(f'测试 {test_id} {status}: {error_message}')
-                
-                # 保存最终报告
-                self._save_final_report(test_id)
-                
-                # 清理资源
-                if test_id in self.running_tests:
-                    del self.running_tests[test_id]
-                
-                # 停止监控
-                k6_monitor.stop_monitoring()
-                
+            for line in pipe:
+                file.write(line)
+                file.flush()  # 确保立即写入
         except Exception as e:
-            logger.error(f'处理测试输出失败: {str(e)}')
-            with app.app_context():
-                self._update_test_status(test_id, 'failed', str(e))
-                # 清理资源
-                if test_id in self.running_tests:
-                    del self.running_tests[test_id]
-                k6_monitor.stop_monitoring()
-        finally:
-            # 关闭包装器
-            if stdout_wrapper:
-                stdout_wrapper.close()
-            if stderr_wrapper:
-                stderr_wrapper.close()
+            self.logger.error(f"读取输出失败: {str(e)}")
+            self.logger.exception(e)
+
+    def start_test(self, script_id, config):
+        """启动k6测试"""
+        if not self.app:
+            self.logger.error("K6Manager not properly initialized. Call init_app first.")
+            return None, None
+
+        try:
+            # 获取脚本路径
+            from models import Script, db, TestResult
+            with self.app.app_context():
+                script = Script.query.get(script_id)
+                if not script:
+                    self.logger.error(f"Script not found: {script_id}")
+                    return None, None
+                
+                # 使用完整的脚本路径
+                script_path = os.path.join(os.getcwd(), self.scripts_dir, script.path)
+                if not os.path.exists(script_path):
+                    self.logger.error(f"Script file not found: {script_path}")
+                    return None, None
+
+                # 创建测试记录
+                test_result = TestResult(
+                    script_id=script_id,
+                    status=TestResult.STATUS_RUNNING,
+                    start_time=datetime.now(),
+                    config=config
+                )
+                db.session.add(test_result)
+                db.session.commit()
+                test_id = test_result.id
+
+            # 确保报告目录存在
+            os.makedirs(self.reports_dir, exist_ok=True)
+
+            # 构建k6命令
+            k6_cmd = self._build_k6_command(config, script_path, test_id)
+            self.logger.info(f"K6 command: {' '.join(k6_cmd)}")
             
-            # 确保进程被终止
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    process.wait(timeout=5)
-            except Exception as e:
-                logger.error(f'终止进程失败: {str(e)}')
+            # 创建进程
+            process = self._create_process(k6_cmd)
+            if not process:
+                return None, None
 
-    def _handle_output_line(self, test_id, line, metrics_data, is_error=False):
-        """处理单行输出"""
-        try:
-            if not line:
-                return
-                
-            if is_error:
-                if 'error' in line.lower():
-                    logger.error(f'K6错误: {line}')
-                    self._update_test_status(test_id, 'error', line)
-                elif 'warning' in line.lower():
-                    logger.warning(f'K6警告: {line}')
-                else:
-                    logger.info(f'K6信息: {line}')
-            else:
-                try:
-                    data = json.loads(line)
-                    metrics_data.append(data)
-                    self._process_metrics(test_id, data)
-                except json.JSONDecodeError:
-                    if 'error' in line.lower():
-                        logger.error(f'K6输出: {line}')
-                    else:
-                        logger.info(f'K6输出: {line}')
-                        
+            self.active_tests[test_id] = {
+                'process': process,
+                'start_time': datetime.now(),
+                'duration': config.get('duration', 30),
+                'status': TestResult.STATUS_RUNNING,
+                'stdout_file': None,
+                'stderr_file': None,
+                'last_read_position': 0  # 添加文件读取位置记录
+            }
+
+            # 启动监控线程
+            monitor_thread = threading.Thread(
+                target=self._monitor_test,
+                args=(test_id,),
+                daemon=True
+            )
+            monitor_thread.start()
+
+            return test_id, process
+
         except Exception as e:
-            logger.error(f'处理输出行失败: {str(e)}', exc_info=True)
+            self.logger.error(f"启动测试失败: {str(e)}")
+            return None, None
 
-    def _process_metrics(self, test_id, data):
-        """处理指标数据"""
-        if test_id not in self.running_tests:
+    def _build_k6_command(self, config, script_path, test_id):
+        """构建k6命令"""
+        vus = config.get('vus', 1)
+        duration = config.get('duration', 30)
+        ramp_time = config.get('ramp_time')
+
+        # 构建输出文件路径
+        summary_file = os.path.join(self.reports_dir, f"test_{test_id}_summary.json")
+
+        # 确保k6路径正确
+        k6_path = self.k6_path
+        if os.name == 'nt':  # Windows
+            k6_path = k6_path.strip('"')  # 移除可能存在的引号
+            if ' ' in k6_path:
+                k6_path = f'"{k6_path}"'  # 如果路径包含空格，添加引号
+
+        # 构建基本命令
+        k6_cmd = [
+            k6_path,
+            'run',
+            '--vus', str(vus),
+            '--out', 'json=-',  # 输出JSON格式到标准输出
+            '--summary-export', summary_file
+        ]
+
+        # 添加阶段配置
+        if ramp_time:
+            k6_cmd.extend([
+                '--stage', f"0s:{vus}",
+                '--stage', f"{ramp_time}s:{vus}",
+                '--stage', f"{duration}s:{vus}"
+            ])
+        else:
+            k6_cmd.extend(['--duration', f"{duration}s"])
+
+        # 添加脚本路径
+        if os.name == 'nt' and ' ' in script_path:
+            script_path = f'"{script_path}"'
+        k6_cmd.append(script_path)
+
+        # 记录完整命令
+        self.logger.info(f"构建的k6命令: {' '.join(k6_cmd)}")
+
+        return k6_cmd
+
+    def _monitor_test(self, test_id):
+        """监控测试进程并更新状态"""
+        if test_id not in self.active_tests:
+            self.logger.error(f"找不到测试ID: {test_id}")
             return
 
-        try:
-            test_info = self.running_tests[test_id]
-            metrics = test_info['metrics']
-
-            if data.get('type') == 'Point':
-                metric_name = data.get('metric')
-                value = data.get('data', {}).get('value')
-
-                if metric_name and value is not None:
-                    if metric_name == 'http_reqs':
-                        metrics['http_reqs'] = max(0, int(value))
-                    elif metric_name == 'http_req_duration':
-                        metrics['http_req_duration'] = max(0, float(value))
-                    elif metric_name == 'http_req_failed':
-                        metrics['http_req_failed'] = max(0, int(value))
-                    elif metric_name == 'vus':
-                        metrics['vus'] = max(0, int(value))
-
-                    # 计算衍生指标
-                    self._calculate_derived_metrics(test_id)
-
-        except Exception as e:
-            logger.error(f'处理指标数据失败: {str(e)}')
-
-    def _calculate_derived_metrics(self, test_id):
-        """计算衍生指标"""
-        test_info = self.running_tests[test_id]
-        metrics = test_info['metrics']
-        elapsed_time = max(0.1, time.time() - test_info['start_time'])
-
-        # 计算 RPS
-        metrics['rps'] = round(metrics['http_reqs'] / elapsed_time, 2)
-
-        # 计算失败率
-        if metrics['http_reqs'] > 0:
-            metrics['failure_rate'] = round((metrics['http_req_failed'] / metrics['http_reqs']) * 100, 2)
-
-        # 更新进度
-        progress = min(100, (elapsed_time / test_info['duration']) * 100)
-        test_info['progress'] = round(progress, 1)
-
-        # 广播更新
-        self._broadcast_metrics(test_id)
-
-    def _broadcast_metrics(self, test_id):
-        """广播指标更新"""
-        try:
-            test_info = self.running_tests[test_id]
-            metrics = test_info['metrics']
-            
-            broadcast_data = {
-                'test_id': test_id,
-                'totalRequests': metrics['http_reqs'],
-                'failureRate': metrics['failure_rate'],
-                'currentRPS': metrics['rps'],
-                'avgResponseTime': metrics['http_req_duration'],
-                'vus': metrics['vus'],
-                'progress': test_info.get('progress', 0),
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            k6_monitor.broadcast_metrics(broadcast_data)
-            
-        except Exception as e:
-            logger.error(f'广播指标失败: {str(e)}')
-
-    def _save_metrics_data(self, test_id, metrics_data):
-        """保存指标数据"""
-        try:
-            test_info = self.running_tests.get(test_id)
-            if not test_info or 'files' not in test_info:
-                return
-
-            metrics_file = test_info['files'].get('metrics')
-            if not metrics_file:
-                return
-
-            with open(metrics_file, 'w', encoding='utf-8') as f:
-                json.dump(metrics_data, f, ensure_ascii=False, indent=2)
-            logger.info(f'已保存指标数据到: {metrics_file}')
-
-        except Exception as e:
-            logger.error(f'保存指标数据失败: {str(e)}')
-
-    def _update_test_status(self, test_id, status, message=None):
-        """更新测试状态"""
-        try:
-            test_result = db.session.get(TestResult, test_id)
-            if test_result:
-                # 如果当前状态已经是终止状态，不再更新
-                if test_result.status in ['completed', 'failed', 'stopped']:
-                    logger.warning(f'测试 {test_id} 已经处于终止状态: {test_result.status}，忽略状态更新: {status}')
-                    return
-                
-                test_result.status = status
-                test_result.end_time = datetime.now() if status in ['completed', 'failed', 'stopped'] else None
-                
-                # 只在特定状态下更新错误信息
-                if status in ['failed', 'error']:
-                    test_result.error_message = message
-                
-                db.session.commit()
-                
-                # 如果测试结束，停止监控
-                if status in ['completed', 'failed', 'stopped']:
-                    k6_monitor.stop_monitoring()
-                    logger.info(f'测试 {test_id} 状态更新为 {status}，已停止监控')
-                
-                # 广播状态更新
-                broadcast_test_status(test_id, status, message)
-                
-        except Exception as e:
-            logger.error(f'更新测试状态失败: {str(e)}')
-
-    def stop_test(self, test_id):
-        """停止测试"""
-        try:
-            # 确保test_id是整数
-            if isinstance(test_id, dict):
-                test_id = test_id.get('test_id')
-            
-            if test_id is None:
-                logger.error('无效的test_id: None')
-                return False
-                
-            # 转换为整数
-            try:
-                test_id = int(test_id)
-            except (TypeError, ValueError):
-                logger.error(f'无效的test_id格式: {test_id}')
-                return False
-            
-            if test_id not in self.running_tests:
-                logger.warning(f'测试 {test_id} 不存在或已停止')
-                return False
-                
-            test_info = self.running_tests[test_id]
-            process = test_info.get('process')
-            
-            if not process:
-                logger.warning(f'测试 {test_id} 的进程不存在')
-                return False
-                
-            logger.info(f'正在停止测试 {test_id}')
-            
-            # 尝试正常终止进程
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning(f'测试 {test_id} 未能正常终止，强制结束')
-                process.kill()
-                process.wait(timeout=1)
-            
-            # 保存最终报告
-            self._save_final_report(test_id)
-            
-            # 更新状态
-            self._update_test_status(test_id, 'stopped', '测试已停止')
-            
-            # 清理资源
-            if test_id in self.running_tests:
-                del self.running_tests[test_id]
-            
-            # 停止监控
-            k6_monitor.stop_monitoring()
-            
-            logger.info(f'测试 {test_id} 已停止')
-            return True
-            
-        except Exception as e:
-            error_msg = f'停止测试失败: {str(e)}'
-            logger.error(error_msg)
-            return False
-
-    def _save_final_report(self, test_id):
-        """保存最终报告"""
-        if test_id in self.running_tests:
-            try:
-                test_info = self.running_tests[test_id]
-                summary_file = test_info['files'].get('summary')
-                if not summary_file:
-                    return
-
-                summary_data = {
-                    'timestamp': datetime.now().isoformat(),
-                    'test_id': test_id,
-                    'status': test_info['status'],
-                    'duration': test_info['duration'],
-                    'progress': test_info.get('progress', 0),
-                    'metrics': test_info.get('metrics', {})
-                }
-
-                with open(summary_file, 'w', encoding='utf-8') as f:
-                    json.dump(summary_data, f, ensure_ascii=False, indent=2)
-                logger.info(f'已保存最终报告到: {summary_file}')
-
-            except Exception as e:
-                logger.error(f'保存最终报告失败: {str(e)}')
-
-    def get_test_status(self, test_id):
-        """获取测试状态"""
-        if test_id not in self.running_tests:
-            return {'status': 'not_found', 'error': '测试不存在'}
-        
-        test_info = self.running_tests[test_id]
+        test_info = self.active_tests[test_id]
         process = test_info['process']
-        
-        if process.poll() is not None and test_info['status'] == 'running':
-            if process.returncode == 0:
-                test_info['status'] = 'completed'
-            else:
-                test_info['status'] = 'failed'
-        
-        return {
-            'status': test_info['status'],
-            'progress': test_info.get('progress', 0),
-            'metrics': test_info.get('metrics', {})
+        total_duration = float(test_info['duration'])  # 确保是浮点数
+
+        # 初始化指标
+        metrics = {
+            'vus': 0,
+            'http_reqs': 0,
+            'http_req_duration_avg': 0.0,
+            'error_rate': 0.0,
+            'iterations': 0,
+            'total_requests': 0,
+            'total_duration': 0.0,
+            'failed_requests': 0,
+            'last_update_time': time.time(),
+            'start_time': time.time(),
+            'endpoints': {}
         }
 
-    def get_running_tests(self):
-        """获取正在运行的测试列表"""
-        return [{
-            'test_id': test_id,
-            'status': info['status'],
-            'progress': info.get('progress', 0),
-            'start_time': info['start_time'],
-            'duration': info['duration'],
-            'metrics': info.get('metrics', {})
-        } for test_id, info in self.running_tests.items()]
+        try:
+            # 初始化时发送一次状态更新
+            self._broadcast_metrics(test_id, 0, metrics)
+            self.logger.info(f"Started monitoring test {test_id}")
+            
+            # 创建非阻塞的读取器
+            output_queue = queue.Queue()
+            error_queue = queue.Queue()
 
-    def _broadcast_with_retry(self, event, data, test_id, max_retries=3):
-        """添加重试机制的广播函数"""
-        from app import broadcast_metrics, broadcast_test_status
-        
-        for attempt in range(max_retries):
+            def read_output(pipe, queue):
+                try:
+                    for line in pipe:
+                        line = line.strip()
+                        if line:  # 只处理非空行
+                            queue.put(line)
+                except Exception as e:
+                    self.logger.error(f"读取输出失败: {str(e)}")
+
+            # 启动输出读取线程
+            stdout_thread = threading.Thread(target=read_output, args=(process.stdout, output_queue))
+            stderr_thread = threading.Thread(target=read_output, args=(process.stderr, error_queue))
+            stdout_thread.daemon = True
+            stderr_thread.daemon = True
+            stdout_thread.start()
+            stderr_thread.start()
+
+            # 监控循环
+            last_broadcast_time = time.time()
+            broadcast_interval = 0.5  # 每0.5秒广播一次
+            
+            while process.poll() is None:
+                current_time = time.time()
+                elapsed_time = current_time - metrics['start_time']
+                
+                # 计算进度
+                progress = min(99.9, (elapsed_time / total_duration) * 100)  # 防止提前显示100%
+                
+                # 最终完成时强制设为100%
+                if process.poll() is not None:
+                    progress = 100.0
+                
+                # 处理标准输出
+                metrics_updated = False
+                while not output_queue.empty():
+                    try:
+                        line = output_queue.get_nowait()
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                if isinstance(data, dict) and 'type' in data:
+                                    self._update_metrics(data, metrics)
+                                    metrics_updated = True
+                                    self.logger.debug(f"Updated metrics: {metrics}")
+                            except json.JSONDecodeError:
+                                if not line.startswith('running'):  # 忽略运行状态输出
+                                    self.logger.debug(f"Non-JSON output: {line}")
+                    except queue.Empty:
+                        break
+                    except Exception as e:
+                        self.logger.error(f"处理输出失败: {str(e)}")
+
+                # 处理错误输出
+                while not error_queue.empty():
+                    try:
+                        error = error_queue.get_nowait()
+                        if error:
+                            self.logger.error(f"Error output: {error}")
+                    except queue.Empty:
+                        break
+
+                # 定期广播更新或在指标更新时广播
+                if metrics_updated or current_time - last_broadcast_time >= broadcast_interval:
+                    self.logger.debug(f"Broadcasting metrics - Progress: {progress}%, Metrics: {metrics}")
+                    self._broadcast_metrics(test_id, progress, metrics)
+                    last_broadcast_time = current_time
+
+                time.sleep(0.1)  # 减少CPU使用
+
+            # 测试完成，发送最终状态
+            final_progress = 100
+            self._broadcast_metrics(test_id, final_progress, metrics)
+            
+            # 等待输出读取线程结束
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+
+            # 处理测试完成
+            return_code = process.returncode
+            self.logger.info(f"Test process ended, return code: {return_code}")
+            self.logger.info(f"Final metrics: {metrics}")
+            self._handle_test_completion(test_id, return_code)
+
+        except Exception as e:
+            self.logger.error(f"监控测试失败: {str(e)}")
+            self.logger.exception(e)
+            self._handle_test_completion(test_id, -1)
+
+    def _update_metrics(self, data, metrics):
+        """更新测试指标"""
+        try:
+            # 获取指标名称和值
+            metric_name = data.get('metric')
+            metric_type = data.get('type')
+            metric_value = data.get('data', {}).get('value', 0)
+            
+            self.logger.debug(f"Processing metric: {metric_name}, type: {metric_type}, value: {metric_value}")
+            
+            # 初始化endpoint统计数据结构
+            if 'endpoints' not in metrics:
+                metrics['endpoints'] = {}
+                
+            # 获取请求的URL信息
+            url = data.get('data', {}).get('tags', {}).get('url', '')
+            method = data.get('data', {}).get('tags', {}).get('method', '')
+            name = data.get('data', {}).get('tags', {}).get('name', '')
+            status = data.get('data', {}).get('status', 0)
+            
+            # 如果有URL信息，更新端点统计
+            if url:
+                # 解析URL，只提取路径部分
+                try:
+                    # 如果是完整URL，解析并提取路径
+                    if url.startswith('http'):
+                        parsed_url = urllib.parse.urlparse(url)
+                        endpoint_key = parsed_url.path
+                    else:
+                        # 如果已经是路径，去除可能的查询参数
+                        endpoint_key = url.split('?')[0]
+                except Exception as e:
+                    self.logger.warning(f"解析URL失败: {url}, {str(e)}")
+                    endpoint_key = url
+                
+                # 确保这个端点的数据结构存在
+                if endpoint_key not in metrics['endpoints']:
+                    metrics['endpoints'][endpoint_key] = {
+                        'requests': 0,
+                        'failed': 0,
+                        'total_duration': 0,
+                        'min_duration': float('inf'),
+                        'max_duration': 0,
+                        'avg_duration': 0,
+                        'status_codes': {}
+                    }
+                
+                endpoint = metrics['endpoints'][endpoint_key]
+                
+                # 更新端点统计 - 只在指标类型为Point时更新，避免重复计数
+                if metric_name == 'http_reqs' and metric_type == 'Point':
+                    endpoint['requests'] += 1
+                    
+                    # 更新状态码统计
+                    if status > 0:
+                        status_str = str(status)
+                        endpoint['status_codes'][status_str] = endpoint['status_codes'].get(status_str, 0) + 1
+                        
+                        # 标记失败的请求 (5xx状态码)
+                        if 500 <= status < 600:
+                            endpoint['failed'] += 1
+                
+                elif metric_name == 'http_req_duration' and metric_type == 'Point':
+                    endpoint['total_duration'] += metric_value
+                    endpoint['min_duration'] = min(endpoint['min_duration'], metric_value)
+                    endpoint['max_duration'] = max(endpoint['max_duration'], metric_value)
+                    if endpoint['requests'] > 0:
+                        endpoint['avg_duration'] = endpoint['total_duration'] / endpoint['requests']
+                
+                elif metric_name == 'http_req_failed' and metric_value and metric_type == 'Point':
+                    endpoint['failed'] += 1
+            
+            # 根据指标类型更新metrics字典 (整体统计)
+            if metric_name == 'vus':
+                metrics['vus'] = int(metric_value)
+                self.logger.debug(f"Updated VUs: {metrics['vus']}")
+                
+            elif metric_name == 'http_reqs':
+                # 只在指标类型为Point时更新，避免重复计数
+                if metric_type == 'Point':
+                    # 增加请求计数
+                    current_reqs = metrics.get('http_reqs', 0)
+                    metrics['http_reqs'] = current_reqs + 1
+                    metrics['total_requests'] = metrics['http_reqs']
+                    self.logger.debug(f"Updated requests: {metrics['http_reqs']}")
+                
+            elif metric_name == 'http_req_duration':
+                if metric_type == 'Point':
+                    current_total = metrics.get('total_duration', 0)
+                    current_count = max(1, metrics.get('http_reqs', 1))
+                    metrics['total_duration'] = current_total + metric_value
+                    metrics['http_req_duration_avg'] = metrics['total_duration'] / current_count
+                    self.logger.debug(f"Updated avg duration: {metrics['http_req_duration_avg']}")
+                
+            elif metric_name == 'http_req_failed':
+                if metric_value and metric_type == 'Point':
+                    metrics['failed_requests'] = metrics.get('failed_requests', 0) + 1
+                    current_total = max(1, metrics.get('http_reqs', 1))
+                    metrics['error_rate'] = (metrics['failed_requests'] / current_total) * 100
+                    self.logger.debug(f"Updated error rate: {metrics['error_rate']}%")
+                
+            elif metric_name == 'iterations':
+                metrics['iterations'] = metrics.get('iterations', 0) + 1
+                self.logger.debug(f"Updated iterations: {metrics['iterations']}")
+            
+            # 添加错误请求统计
+            if 500 <= int(data.get('data', {}).get('status', 200)) < 600:
+                metrics['failed_requests'] = metrics.get('failed_requests', 0) + 1
+            
+            # 更新错误率计算
+            total_requests = metrics.get('http_reqs', 1)
+            failed = metrics.get('failed_requests', 0)
+            metrics['error_rate'] = (failed / total_requests) * 100 if total_requests > 0 else 0
+            
+            # 更新时间戳
+            metrics['last_update_time'] = time.time()
+            
+            self.logger.info(f"Metrics updated: {metrics}")
+            
+        except Exception as e:
+            self.logger.error(f"更新指标失败: {str(e)}")
+            self.logger.exception(e)
+
+    def _broadcast_metrics(self, test_id, progress, metrics):
+        """广播指标数据"""
+        try:
+            # 确保进度是有效的数值
+            progress = round(float(progress), 1)
+            progress = max(0, min(100, progress))
+
+            # 计算每秒请求数 (RPS)
+            current_time = time.time()
+            test_duration = current_time - metrics.get('start_time', current_time)
+            
+            # 使用总测试时长计算平均RPS，避免短时间内的RPS波动
+            if test_duration > 0:
+                rps = metrics.get('total_requests', 0) / test_duration
+            else:
+                rps = 0
+                
+            # 限制最大 RPS 显示值为一个合理的值，避免显示异常
+            rps = min(round(rps, 2), 1000)  # 限制最大RPS为1000，更合理
+            # 构建广播数据
+            data = {
+                'test_id': test_id,
+                'progress': progress,
+                'status': K6Manager.STATUS_RUNNING,
+                'metrics': {
+                    'vus': int(metrics.get('vus', 0)),
+                    'rps': round(rps, 2),
+                    'response_time': round(float(metrics.get('http_req_duration_avg', 0)), 2),
+                    'error_rate': round(float(metrics.get('error_rate', 0)), 2),
+                    'total_requests': int(metrics.get('total_requests', 0)),
+                    'failed_requests': int(metrics.get('failed_requests', 0))
+                },
+                'endpoints': []
+            }
+
+            # 处理端点数据
+            if 'endpoints' in metrics and metrics['endpoints']:
+                for endpoint_name, endpoint_metrics in metrics['endpoints'].items():
+                    # 处理无效的最小响应时间
+                    if endpoint_metrics['min_duration'] == float('inf'):
+                        endpoint_metrics['min_duration'] = 0
+                        
+                    # 计算端点的错误率
+                    total_requests = endpoint_metrics['requests']
+                    failed_requests = endpoint_metrics['failed']
+                    error_rate = (failed_requests / total_requests * 100) if total_requests > 0 else 0
+                    
+                    # 格式化端点数据
+                    endpoint_item = {
+                        'name': endpoint_name,
+                        'requests': endpoint_metrics['requests'],
+                        'failed': endpoint_metrics['failed'],
+                        'error_rate': round(error_rate, 2),
+                        'avg_duration': round(endpoint_metrics['avg_duration'], 2),
+                        'min_duration': round(endpoint_metrics['min_duration'], 2),
+                        'max_duration': round(endpoint_metrics['max_duration'], 2),
+                        'status_codes': endpoint_metrics['status_codes']
+                    }
+                    data['endpoints'].append(endpoint_item)
+                
+                # 按请求数量排序，显示最常用的端点在前面
+                data['endpoints'].sort(key=lambda x: x['requests'], reverse=True)
+
+            # 广播数据
+            self.monitor.broadcast_metrics(test_id, data)
+            
+            # 增强日志记录，添加详细的指标数据
+            self.logger.info(f"Broadcasting metrics - Test ID: {test_id}, Progress: {progress}%, RPS: {data['metrics']['rps']}, RT: {data['metrics']['response_time']}ms, Error Rate: {data['metrics']['error_rate']}%, VUs: {data['metrics']['vus']}")
+            self.logger.debug(f"Endpoint metrics: {len(data['endpoints'])} endpoints tracked")
+
+            # 保存指标到数据库
+            self._save_metrics(test_id, data['metrics'])
+
+            # 更新数据库中的测试状态
+            with self.app.app_context():
+                test = TestResult.query.get(test_id)
+                if test:
+                    test.status = K6Manager.STATUS_RUNNING
+                    test.progress = progress
+                    db.session.commit()
+
+        except Exception as e:
+            self.logger.error(f"广播指标失败: {str(e)}")
+            self.logger.exception(e)
+
+    def _save_metrics(self, test_id, metrics):
+        """保存性能指标到数据库"""
+        try:
+            # 确保所有指标都是有效的数值
+            sanitized_metrics = {
+                'vus': int(metrics.get('vus', 0)),
+                'rps': int(metrics.get('rps', 0)),
+                'response_time': round(float(metrics.get('response_time', 0)), 2),
+                'error_rate': round(float(metrics.get('error_rate', 0)), 2)
+            }
+            
+            self.logger.info(f"保存指标到数据库: {sanitized_metrics}")
+            
+            from models import PerformanceMetric, db
+            with self.app.app_context():
+                metric = PerformanceMetric(
+                    test_id=test_id,
+                    vus=sanitized_metrics['vus'],
+                    rps=sanitized_metrics['rps'],
+                    response_time=sanitized_metrics['response_time'],
+                    error_rate=sanitized_metrics['error_rate']
+                )
+                db.session.add(metric)
+                db.session.commit()
+                self.logger.info(f"指标已保存到数据库，ID: {metric.id}")
+        except Exception as e:
+            self.logger.error(f"保存性能指标失败: {str(e)}, 原始数据: {metrics}")
+            self.logger.exception(e)
+
+    def _handle_test_completion(self, test_id, return_code):
+        """处理测试完成"""
+        try:
+            if test_id not in self.active_tests:
+                self.logger.warning(f"Test not found during completion: {test_id}")
+                return
+
+            final_status = self.STATUS_COMPLETED if return_code == 0 else self.STATUS_FAILED
+            
+            # 更新数据库
+            with self.app.app_context():
+                from models import TestResult, db
+                test_result = TestResult.query.get(test_id)
+                if test_result:
+                    test_result.status = final_status
+                    test_result.end_time = datetime.now()
+                    db.session.commit()
+                    self.logger.info(f"Test {test_id} completed with status: {final_status}")
+
+            # 广播最终状态
+            self.monitor.broadcast_metrics(test_id, {
+                'progress': 100,
+                'status': final_status,
+                'timestamp': datetime.now().isoformat()
+            })
+
+        except Exception as e:
+            self.logger.error(f"处理测试完成时出错: {str(e)}")
+            # 尝试设置错误状态
             try:
-                if event == 'metrics':
-                    broadcast_metrics(test_id, data)
-                else:
-                    broadcast_test_status(test_id, data.get('status'), data.get('message'))
-                return True
-            except Exception as e:
-                logger.warning(f'广播失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}')
-                if attempt < max_retries - 1:
-                    time.sleep(1)
+                with self.app.app_context():
+                    from models import TestResult, db
+                    test_result = TestResult.query.get(test_id)
+                    if test_result:
+                        test_result.status = self.STATUS_ERROR
+                        test_result.end_time = datetime.now()
+                        db.session.commit()
+            except Exception as inner_e:
+                self.logger.error(f"更新错误状态失败: {str(inner_e)}")
+        finally:
+            self._cleanup_test(test_id)
+
+    def _cleanup_test(self, test_id):
+        """清理测试资源"""
+        try:
+            if test_id in self.active_tests:
+                test_info = self.active_tests[test_id]
+                process = test_info.get('process')
+                stdout_file = test_info.get('stdout_file')
+                stderr_file = test_info.get('stderr_file')
+
+                # 清理进程
+                if process and process.poll() is None:
+                    try:
+                        process.terminate()
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    except Exception as e:
+                        self.logger.error(f"终止进程失败: {str(e)}")
+
+                # 清理文件
+                if stdout_file:
+                    try:
+                        stdout_file.close()
+                        os.unlink(stdout_file.name)
+                    except Exception as e:
+                        self.logger.error(f"清理stdout文件失败: {str(e)}")
+
+                if stderr_file:
+                    try:
+                        stderr_file.close()
+                        os.unlink(stderr_file.name)
+                    except Exception as e:
+                        self.logger.error(f"清理stderr文件失败: {str(e)}")
+
+                del self.active_tests[test_id]
+                self.logger.info(f"Test {test_id} resources cleaned up")
+
+        except Exception as e:
+            self.logger.error(f"清理测试资源失败: {str(e)}")
+
+    def stop_test(self, test_id):
+        """停止指定的测试"""
+        try:
+            if test_id not in self.active_tests:
+                self.logger.warning(f"Test not found: {test_id}")
+                return False
+
+            test_info = self.active_tests[test_id]
+            process = test_info['process']
+            
+            # 尝试正常终止进程
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                except Exception as e:
+                    self.logger.error(f"终止进程失败: {str(e)}")
+
+            # 更新测试状态
+            with self.app.app_context():
+                from models import TestResult, db
+                test_result = TestResult.query.get(test_id)
+                if test_result:
+                    test_result.status = self.STATUS_STOPPED
+                    test_result.end_time = datetime.now()
+                    db.session.commit()
+                    self.logger.info(f"Test {test_id} stopped successfully")
+
+            # 广播状态更新
+            self.monitor.broadcast_metrics(test_id, {
+                'progress': 100,
+                'status': self.STATUS_STOPPED,
+                'timestamp': datetime.now().isoformat()
+            })
+
+            # 清理资源
+            self._cleanup_test(test_id)
+            return True
+
+        except Exception as e:
+            self.logger.error(f"停止测试失败: {str(e)}")
             return False
 
-    def _check_connection(self, test_id):
-        """检查客户端连接状态"""
-        if not request.namespace.socket.connected:
-            logger.warning(f'客户端 {test_id} 已断开连接')
-            return False
-        return True
+    def get_running_tests(self):
+        """获取所有正在运行的测试ID列表"""
+        return list(self.active_tests.keys())
+
+
+# 创建单例实例
+k6_manager = K6Manager()

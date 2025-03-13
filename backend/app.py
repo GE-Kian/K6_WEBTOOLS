@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 from gevent import monkey
 monkey.patch_all()
 
@@ -13,7 +10,7 @@ import json
 import logging
 from dotenv import load_dotenv
 from models import db, TestConfig, TestResult, PerformanceMetric, Script
-from k6_manager import K6Manager, k6_monitor
+from k6_manager import k6_manager
 from werkzeug.utils import secure_filename
 import mysql.connector
 import sys
@@ -46,7 +43,7 @@ load_dotenv()
 
 # 文件上传配置
 MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB限制
-ALLOWED_EXTENSIONS = {'js'}
+# ALLOWED_EXTENSIONS = {'js'}
 UPLOAD_TIMEOUT = 30  # 30秒超时
 
 def allowed_file(filename):
@@ -68,17 +65,12 @@ for directory in [data_dir, scripts_dir, reports_dir]:
         logger.info(f'创建目录: {directory}')
 
 # 数据库配置
-db_uri = os.getenv('SQLALCHEMY_DATABASE_URI')
-if db_uri and db_uri.startswith('sqlite:///'):
-    # 如果是 SQLite，确保使用绝对路径
-    db_path = db_uri.replace('sqlite:///', '')
-    if not os.path.isabs(db_path):
-        db_path = os.path.join(data_dir, db_path)
-    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
-else:
-    # 如果是其他数据库（如MySQL），直接使用配置的URI
-    app.config['SQLALCHEMY_DATABASE_URI'] = db_uri or f'sqlite:///{os.path.join(data_dir, "k6_webtools.db")}'
+db_uri = os.getenv('DATABASE_URL')
+if not db_uri:
+    logger.error('未找到数据库配置，请检查 .env 文件中的 DATABASE_URL')
+    raise ValueError('未找到数据库配置')
 
+app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_POOL_SIZE'] = int(os.getenv('DB_POOL_SIZE', 10))
 app.config['SQLALCHEMY_MAX_OVERFLOW'] = int(os.getenv('DB_MAX_OVERFLOW', 20))
@@ -88,8 +80,6 @@ app.config['SQLALCHEMY_POOL_TIMEOUT'] = int(os.getenv('DB_POOL_TIMEOUT', 30))
 db.init_app(app)
 with app.app_context():
     try:
-        # 删除现有的表（如果存在）
-        db.drop_all()
         # 创建新的表结构
         db.create_all()
         logger.info('数据库连接成功并完成初始化')
@@ -178,30 +168,16 @@ def broadcast_to_room(event, data, room):
         'timestamp': datetime.now().isoformat()
     }, room=room)
 
-def broadcast_metrics(test_id, metrics_data):
-    """广播测试指标数据"""
-    socketio.emit('test_metrics', {
-        'test_id': test_id,
-        'data': metrics_data,
-        'timestamp': datetime.now().isoformat()
-    })
-
-def broadcast_test_status(test_id, status, message=None):
-    """广播测试状态更新"""
-    socketio.emit('test_status', {
-        'test_id': test_id,
-        'status': status,
-        'message': message,
-        'timestamp': datetime.now().isoformat()
-    })
-
 # 配置文件上传大小限制和超时
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 app.config['UPLOAD_TIMEOUT'] = UPLOAD_TIMEOUT
 
-# 初始化K6管理器
-k6_manager = K6Manager()
-k6_manager.init_app(app)
+# 初始化k6_manager
+k6_manager.init_app(
+    app,
+    scripts_dir=scripts_dir,
+    reports_dir=reports_dir
+)
 
 # 确保脚本和报告目录存在
 scripts_dir = os.getenv('K6_SCRIPTS_DIR', os.path.join(app.root_path, 'scripts'))
@@ -224,68 +200,136 @@ def upload_script():
         logger.info(f'请求文件: {request.files}')
         
         # 检查是否有文件
-        if 'file' not in request.files:
+        if 'file' in request.files:
+            # 单文件上传
+            files = [request.files['file']]
+            logger.info(f'接收到单个文件: {files[0].filename}')
+        elif 'files[]' in request.files:
+            # 多文件上传
+            files = request.files.getlist('files[]')
+            logger.info(f'接收到多个文件: {len(files)}个')
+        else:
             logger.error('没有文件部分')
             return jsonify({'error': '没有文件部分'}), 400
-            
-        file = request.files['file']
-        logger.info(f'接收到文件: {file.filename}')
         
-        # 检查文件名
-        if file.filename == '':
+        if len(files) == 0 or all(f.filename == '' for f in files):
             logger.error('没有选择文件')
             return jsonify({'error': '没有选择文件'}), 400
+        
+        # 获取第一个有效文件名作为文件夹名称的基础
+        main_filename = None
+        for file in files:
+            if file.filename and file.filename != '':
+                main_filename = os.path.splitext(file.filename)[0]
+                break
+                
+        if not main_filename:
+            main_filename = "script"
             
-        # 检查文件类型
-        if not file.filename.endswith('.js'):
-            logger.error(f'不支持的文件类型: {file.filename}')
-            return jsonify({'error': '只支持.js文件'}), 400
-            
-        # 安全处理文件名
-        filename = secure_filename(file.filename)
-        logger.info(f'安全处理后的文件名: {filename}')
+        # 创建以第一个文件名为基础的文件夹名称
+        folder_name = f"{main_filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # 确保目录存在
         scripts_dir = os.getenv('K6_SCRIPTS_DIR', 'scripts')
         full_scripts_dir = os.path.join(app.root_path, scripts_dir)
-        dist_dir = os.path.join(full_scripts_dir, 'dist')  # 添加dist目录
+        folder_path = os.path.join(full_scripts_dir, folder_name)
+        dist_dir = os.path.join(folder_path, 'dist')  # 添加dist目录
         
         # 创建必要的目录
-        for directory in [full_scripts_dir, dist_dir]:
+        for directory in [full_scripts_dir, folder_path, dist_dir]:
             os.makedirs(directory, exist_ok=True)
             logger.info(f'确保目录存在: {directory}')
         
-        # 保存文件
-        try:
-            file_path = os.path.join(full_scripts_dir, filename)
-            logger.info(f'尝试保存文件到: {file_path}')
-            file.save(file_path)
-            logger.info(f'文件已保存到: {file_path}, 文件大小: {os.path.getsize(file_path)} 字节')
-            
-            # 检查并创建crypto-bundle.js在同一目录
-            crypto_bundle_path = os.path.join(full_scripts_dir, 'crypto-bundle.js')
-            if not os.path.exists(crypto_bundle_path):
-                with open(crypto_bundle_path, 'w', encoding='utf-8') as f:
-                    f.write('// Crypto bundle placeholder\n')
-                logger.info(f'创建crypto-bundle.js: {crypto_bundle_path}')
-                
-        except Exception as e:
-            logger.error(f'保存文件失败: {str(e)}', exc_info=True)
-            return jsonify({'error': f'保存文件失败: {str(e)}'}), 500
+        # 保存所有文件
+        saved_files = []
+        main_file = None
         
+        for file in files:
+            # 检查文件名
+            if file.filename == '':
+                continue
+                
+            # 安全处理文件名
+            filename = secure_filename(file.filename)
+            
+            # 检查文件类型
+            if not (filename.endswith('.js') or filename.endswith('.json')):
+                logger.warning(f'跳过不支持的文件类型: {filename}')
+                continue
+                
+            logger.info(f'处理文件: {filename}')
+            
+            # 保存文件
+            try:
+                file_path = os.path.join(folder_path, filename)
+                logger.info(f'尝试保存文件到: {file_path}')
+                file.save(file_path)
+                logger.info(f'文件已保存到: {file_path}, 文件大小: {os.path.getsize(file_path)} 字节')
+                
+                saved_files.append({
+                    'name': filename,
+                    'path': file_path
+                })
+                
+                # 第一个JS文件作为主文件
+                if main_file is None and filename.endswith('.js'):
+                    main_file = {
+                        'name': filename,
+                        'path': file_path
+                    }
+                
+            except Exception as e:
+                logger.error(f'保存文件失败: {str(e)}', exc_info=True)
+                return jsonify({'error': f'保存文件失败: {str(e)}'}), 500
+        
+        if not saved_files:
+            logger.error('没有成功保存任何文件')
+            return jsonify({'error': '没有成功保存任何文件'}), 400
+            
+        if main_file is None:
+            main_file = saved_files[0]
+        
+        # 检查并创建crypto-bundle.js在同一目录
+        crypto_bundle_path = os.path.join(folder_path, 'crypto-bundle.js')
+        if not os.path.exists(crypto_bundle_path):
+            with open(crypto_bundle_path, 'w', encoding='utf-8') as f:
+                f.write('// Crypto bundle placeholder\n')
+            logger.info(f'创建crypto-bundle.js: {crypto_bundle_path}')
+            
+        # 创建user.json文件
+        user_json_path = os.path.join(folder_path, 'user.json')
+        if not os.path.exists(user_json_path):
+            default_user_data = {
+                "baseUrl": "http://localhost:8080",
+                "users": [
+                    {"username": "testuser1", "password": "password123"},
+                    {"username": "testuser2", "password": "password123"}
+                ],
+                "thinkTime": {
+                    "min": 1,
+                    "max": 3
+                }
+            }
+            with open(user_json_path, 'w', encoding='utf-8') as f:
+                json.dump(default_user_data, f, ensure_ascii=False, indent=2)
+            logger.info(f'创建默认user.json文件: {user_json_path}')
+            
         # 创建脚本记录
         try:
             script = Script(
-                name=filename,
-                filename=filename,
-                path=file_path,
+                name=main_file['name'],
+                filename=main_file['name'],
+                path=main_file['path'],
+                folder_path=folder_path,
+                folder_name=folder_name,
                 dependencies={
-                    'crypto_bundle': crypto_bundle_path
+                    'crypto_bundle': crypto_bundle_path,
+                    'files': [f['name'] for f in saved_files]
                 }
             )
             db.session.add(script)
             db.session.commit()
-            logger.info(f'脚本记录已创建: ID={script.id}, 名称={filename}')
+            logger.info(f'脚本记录已创建: ID={script.id}, 名称={main_file["name"]}, 文件夹={folder_name}')
         except Exception as e:
             logger.error(f'创建脚本记录失败: {str(e)}', exc_info=True)
             return jsonify({'error': f'创建脚本记录失败: {str(e)}'}), 500
@@ -295,9 +339,12 @@ def upload_script():
             'name': script.name,
             'filename': script.filename,
             'path': script.path,
+            'folder_path': script.folder_path,
+            'folder_name': script.folder_name,
             'description': script.description,
             'created_at': script.created_at.isoformat(),
-            'dependencies': script.dependencies
+            'dependencies': script.dependencies,
+            'files': [f['name'] for f in saved_files]
         }), 201
         
     except Exception as e:
@@ -315,72 +362,72 @@ def health_check():
         'service': 'k6-web-tools'
     }), 200
 
-@app.route('/api/tests/start', methods=['POST', 'OPTIONS'])
-@cross_origin()
+@app.route('/api/tests/start', methods=['POST'])
 def start_test():
-    """启动性能测试"""
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'})
-
     try:
         data = request.get_json()
         script_id = data.get('script_id')
-        
-        if not script_id:
-            return jsonify({'success': False, 'message': '缺少脚本ID'}), 400
-
-        # 获取脚本信息
-        script = db.session.get(Script, script_id)
-        if not script:
-            return jsonify({'success': False, 'message': '脚本不存在'}), 404
-
-        if not os.path.exists(script.path):
-            return jsonify({'success': False, 'message': '脚本文件不存在'}), 404
-
-        # 准备测试配置
         config = {
             'vus': data.get('vus', 1),
             'duration': data.get('duration', 30),
-            'ramp_time': data.get('ramp_time', 0)
+            'ramp_time': data.get('ramp_time')
         }
+        
+        app.logger.info(f"收到测试启动请求: {data}")
+        app.logger.info(f"启动测试: 脚本ID={script_id}, 配置={config}")
 
-        # 启动测试
         test_id, process = k6_manager.start_test(script_id, config)
         
-        if process:
+        if test_id is None:
             return jsonify({
-                'success': True,
-                'message': '测试已启动',
-                'test_id': test_id
-            })
-        else:
-            return jsonify({'success': False, 'message': '启动测试失败'}), 500
+                'status': 'error',
+                'message': '启动测试失败'
+            }), 500
+
+        return jsonify({
+            'status': 'success',
+            'test_id': test_id
+        }), 201
 
     except Exception as e:
-        logger.error(f'启动测试失败: {str(e)}')
-        return jsonify({'success': False, 'message': str(e)}), 500
+        app.logger.error(f"启动测试失败: {str(e)}", exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 @app.route('/api/tests/stop', methods=['POST', 'OPTIONS'])
-@cross_origin()
 def stop_test():
     """停止性能测试"""
     if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'})
+        return '', 204
 
     try:
-        # 获取当前运行的测试
-        running_tests = k6_manager.get_running_tests()
-        if not running_tests:
-            return jsonify({'success': False, 'message': '没有正在运行的测试'}), 404
-
-        # 停止所有运行的测试
-        for test_id in running_tests:
-            k6_manager.stop_test(test_id)
-
-        return jsonify({'success': True, 'message': '测试已停止'})
+        data = request.get_json()
+        logger.info(f'收到测试停止请求: {data}')
+        
+        # 获取请求中的test_id
+        test_id = data.get('test_id')
+        
+        # 直接尝试停止指定的测试，不检查是否在运行列表中
+        if test_id:
+            logger.info(f'尝试停止测试: {test_id}')
+            result = k6_manager.stop_test(test_id)
+            if result:
+                return jsonify({'success': True, 'message': f'测试 {test_id} 已停止'})
+            else:
+                # 即使测试不在运行列表中，也返回成功，因为最终目标是确保测试不在运行
+                return jsonify({'success': True, 'message': f'测试 {test_id} 不在运行中或已停止'})
+        else:
+            # 停止所有运行的测试
+            running_tests = k6_manager.get_running_tests()
+            logger.info(f'停止所有测试: {running_tests}')
+            for test_id in running_tests:
+                k6_manager.stop_test(test_id)
+            return jsonify({'success': True, 'message': '所有测试已停止'})
 
     except Exception as e:
-        logger.error(f'停止测试失败: {str(e)}')
+        logger.error(f'停止测试失败: {str(e)}', exc_info=True)
         return jsonify({'success': False, 'message': str(e)}), 500
 
 @socketio.on('connect', namespace='/ws/metrics')
@@ -393,7 +440,7 @@ def handle_disconnect():
 
 @socketio.on('join', namespace='/ws/metrics')
 def handle_join(test_id):
-    k6_monitor.add_websocket_client(request.sid)
+    k6_manager.add_websocket_client(request.sid)
     emit('joined', {'test_id': test_id})
 
 # 主程序入口

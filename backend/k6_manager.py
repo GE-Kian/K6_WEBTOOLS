@@ -369,10 +369,24 @@ class K6Manager:
 
     def _build_k6_command(self, config, script_path, test_id):
         """构建k6命令"""
-        vus = config.get('vus', 1)
-        duration = config.get('duration', 30)
-        ramp_time = config.get('ramp_time')
-
+        # 初始化k6命令
+        k6_cmd = [self.k6_path, 'run']
+        
+        # 添加JSON输出标志，以便能够解析进度
+        k6_cmd.extend(['--out', 'json'])
+        
+        # 添加并发用户数量
+        vus = int(config.get('vus', 1))
+        
+        # 添加持续时间
+        duration = int(config.get('duration', 30))
+        
+        # 保存配置信息到活动测试字典
+        self.active_tests[test_id] = {
+            'vus': vus,
+            'duration': duration
+        }
+        
         # 构建输出文件路径
         summary_file = os.path.join(self.reports_dir, f"test_{test_id}_summary.json")
 
@@ -393,10 +407,10 @@ class K6Manager:
         ]
 
         # 添加阶段配置
-        if ramp_time:
+        if config.get('ramp_time'):
             k6_cmd.extend([
                 '--stage', f"0s:{vus}",
-                '--stage', f"{ramp_time}s:{vus}",
+                '--stage', f"{config['ramp_time']}s:{vus}",
                 '--stage', f"{duration}s:{vus}"
             ])
         else:
@@ -421,10 +435,11 @@ class K6Manager:
         test_info = self.active_tests[test_id]
         process = test_info['process']
         total_duration = float(test_info['duration'])  # 确保是浮点数
+        configured_vus = int(test_info.get('vus', 0))  # 获取配置的VU数量
 
         # 初始化指标
         metrics = {
-            'vus': 0,
+            'vus': configured_vus,  # 使用配置的VU数量初始化，而不是0
             'http_reqs': 0,
             'http_req_duration_avg': 0.0,
             'error_rate': 0.0,
@@ -610,11 +625,16 @@ class K6Manager:
                     endpoint['failed'] += 1
             
             # 根据指标类型更新metrics字典 (整体统计)
-            if metric_name == 'vus':
+            if metric_name == 'vus' and metric_type == 'Gauge':
+                # k6有时使用Gauge类型（而不是Point类型）来报告虚拟用户数量
+                metrics['vus'] = int(metric_value)
+                self.logger.debug(f"Updated VUs from k6 metric: {metrics['vus']}")
+            elif metric_name == 'vus':
                 metrics['vus'] = int(metric_value)
                 self.logger.debug(f"Updated VUs: {metrics['vus']}")
-                
-            elif metric_name == 'http_reqs':
+            
+            # 根据指标类型更新metrics字典 (整体统计)
+            if metric_name == 'http_reqs':
                 # 只在指标类型为Point时更新，避免重复计数
                 if metric_type == 'Point':
                     # 增加请求计数

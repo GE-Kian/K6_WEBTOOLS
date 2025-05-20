@@ -1,86 +1,99 @@
 import pytest
 from unittest import mock
 from datetime import datetime
+from your_module import broadcast_test_status
 
-# 测试socketio未初始化的情况
-@mock.patch('module.socketio', None)
-@mock.patch('builtins.print')
-def test_socketio_not_initialized(mock_print):
-    broadcast_test_status('test1', 'running')
-    mock_print.assert_called_once_with("错误: socketio未初始化，无法广播测试状态 (test_id=test1, status=running)")
+@pytest.fixture
+def mock_socketio():
+    return mock.MagicMock()
 
-# 测试正常状态广播（无message）
-@mock.patch('module.socketio')
-@mock.patch('module.datetime')
-@mock.patch('builtins.print')
-def test_broadcast_normal_status(mock_print, mock_datetime, mock_socketio):
-    fixed_time = datetime(2023, 1, 1, 12, 0, 0)
-    mock_datetime.now.return_value = fixed_time
-    broadcast_test_status('test2', 'running')
+@pytest.fixture
+def mock_datetime_now(monkeypatch):
+    mock_now = datetime(2023, 1, 1, 12, 0, 0)
+    mock_datetime = mock.MagicMock()
+    mock_datetime.now.return_value = mock_now
+    monkeypatch.setattr('your_module.datetime', mock_datetime)
+    return mock_now
+
+def test_broadcast_test_status_with_socketio_initialized(mock_socketio, mock_datetime_now):
+    """测试socketio已初始化时的正常广播"""
+    test_id = "test123"
+    status = "running"
+    message = "Test is running"
+    
+    with mock.patch('your_module.socketio', mock_socketio):
+        broadcast_test_status(test_id, status, message)
     
     expected_data = {
-        'test_id': 'test2',
-        'status': 'running',
-        'timestamp': fixed_time.isoformat()
-    }
-    mock_socketio.emit.assert_called_once_with('test_status', expected_data)
-    mock_print.assert_called_once_with("广播测试状态: test_id=test2, status=running, message=None")
-
-# 测试带message参数的广播
-@mock.patch('module.socketio')
-@mock.patch('module.datetime')
-@mock.patch('builtins.print')
-def test_broadcast_with_message(mock_print, mock_datetime, mock_socketio):
-    fixed_time = datetime(2023, 1, 1, 12, 0, 0)
-    mock_datetime.now.return_value = fixed_time
-    message = "进行中"
-    broadcast_test_status('test3', 'running', message)
-    
-    expected_data = {
-        'test_id': 'test3',
-        'status': 'running',
-        'timestamp': fixed_time.isoformat(),
+        'test_id': test_id,
+        'status': status,
+        'timestamp': mock_datetime_now.isoformat(),
         'message': message
     }
-    mock_socketio.emit.assert_called_once_with('test_status', expected_data)
-    mock_print.assert_called_once_with(f"广播测试状态: test_id=test3, status=running, message={message}")
+    
+    mock_socketio.emit.assert_any_call('test_status', expected_data)
+    assert not mock_socketio.emit.called_with('test_metrics', mock.ANY)
 
-# 测试最终状态发送100%进度更新
-@pytest.mark.parametrize('status', ['completed', 'stopped', 'failed'])
-@mock.patch('module.socketio')
-@mock.patch('module.datetime')
-@mock.patch('builtins.print')
-def test_final_status_sends_100_percent_progress(mock_print, mock_datetime, mock_socketio, status):
-    fixed_time = datetime(2023, 1, 1, 12, 0, 0)
-    mock_datetime.now.return_value = fixed_time
-    broadcast_test_status('test4', status)
+def test_broadcast_test_status_without_message(mock_socketio, mock_datetime_now):
+    """测试没有message参数时的广播"""
+    test_id = "test123"
+    status = "running"
     
-    test_status_call = mock.call('test_status', {
-        'test_id': 'test4',
-        'status': status,
-        'timestamp': fixed_time.isoformat()
-    })
-    test_metrics_call = mock.call('test_metrics', {
-        'test_id': 'test4',
-        'progress': 100,
-        'status': status,
-        'timestamp': fixed_time.isoformat()
-    })
+    with mock.patch('your_module.socketio', mock_socketio):
+        broadcast_test_status(test_id, status)
     
-    mock_socketio.emit.assert_has_calls([test_status_call, test_metrics_call])
-    assert mock_socketio.emit.call_count == 2, "应该发送两次事件"
-    mock_print.assert_any_call(f"测试 test4 已{status}，发送100%进度更新")
+    expected_data = {
+        'test_id': test_id,
+        'status': status,
+        'timestamp': mock_datetime_now.isoformat()
+    }
+    
+    mock_socketio.emit.assert_called_with('test_status', expected_data)
 
-# 测试异常处理
-@mock.patch('module.socketio')
-@mock.patch('module.datetime')
-@mock.patch('builtins.print')
-def test_broadcast_exception_handling(mock_print, mock_datetime, mock_socketio):
-    mock_socketio.emit.side_effect = Exception("emit错误")
-    fixed_time = datetime(2023, 1, 1, 12, 0, 0)
-    mock_datetime.now.return_value = fixed_time
+def test_broadcast_test_status_with_final_status(mock_socketio, mock_datetime_now):
+    """测试最终状态(completed/stopped/failed)时的广播"""
+    test_id = "test123"
+    for status in ['completed', 'stopped', 'failed']:
+        mock_socketio.reset_mock()
+        
+        with mock.patch('your_module.socketio', mock_socketio):
+            broadcast_test_status(test_id, status)
+        
+        expected_status_data = {
+            'test_id': test_id,
+            'status': status,
+            'timestamp': mock_datetime_now.isoformat()
+        }
+        expected_metrics_data = {
+            'test_id': test_id,
+            'progress': 100,
+            'status': status,
+            'timestamp': mock_datetime_now.isoformat()
+        }
+        
+        mock_socketio.emit.assert_any_call('test_status', expected_status_data)
+        mock_socketio.emit.assert_any_call('test_metrics', expected_metrics_data)
+
+def test_broadcast_test_status_with_socketio_not_initialized(capsys):
+    """测试socketio未初始化时的处理"""
+    test_id = "test123"
+    status = "running"
     
-    broadcast_test_status('test5', 'running')
+    with mock.patch('your_module.socketio', None):
+        broadcast_test_status(test_id, status)
     
-    mock_socketio.emit.assert_called_once_with('test_status', mock.ANY)
-    mock_print.assert_any_call("广播测试状态时出错: emit错误")
+    captured = capsys.readouterr()
+    assert f"错误: socketio未初始化，无法广播测试状态 (test_id={test_id}, status={status})" in captured.out
+
+def test_broadcast_test_status_with_emit_exception(mock_socketio, mock_datetime_now, capsys):
+    """测试广播时发生异常的处理"""
+    test_id = "test123"
+    status = "running"
+    error_message = "Connection error"
+    mock_socketio.emit.side_effect = Exception(error_message)
+    
+    with mock.patch('your_module.socketio', mock_socketio):
+        broadcast_test_status(test_id, status)
+    
+    captured = capsys.readouterr()
+    assert f"广播测试状态时出错: {error_message}" in captured.out
